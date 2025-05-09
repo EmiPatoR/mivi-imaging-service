@@ -86,10 +86,11 @@ namespace medical::imaging {
             std::string filePath;         // Path for memory-mapped file (if using file-backed)
             bool enableRealTimeThreads;   // Use real-time priority for notification threads
             bool dropFramesWhenFull;      // Whether to drop frames when buffer is full
+            size_t maxFrameSize;          // Maximum size of a single frame in bytes
 
             // Constructor with sensible defaults
             Config() : name("ultrasound_frames"),
-                       size(128 * 1024 * 1024), // 128 MB
+                       size(256 * 1024 * 1024), // 256 MB
                        type(SharedMemoryType::MEMORY_MAPPED_FILE), // Best for cross-language
                        create(false),
                        maxFrames(120),
@@ -98,7 +99,8 @@ namespace medical::imaging {
                        enableMetadata(true),
                        filePath("/dev/shm/ultrasound_frames"),
                        enableRealTimeThreads(true),
-                       dropFramesWhenFull(true) {
+                       dropFramesWhenFull(true),
+                       maxFrameSize(17 * 1024 * 1024) { // 17MB - enough for 4K frames
             }
         };
 
@@ -140,6 +142,7 @@ namespace medical::imaging {
          * @return true if initialized, false otherwise
          */
         bool isInitialized() const;
+
 
         /**
          * @brief Write a frame to shared memory (zero-copy when possible)
@@ -246,6 +249,13 @@ namespace medical::imaging {
          * @return Maximum frame count
          */
         size_t getMaxFrames() const;
+
+        /**
+         * @brief Update the maximum frame size to handle larger frame formats
+         * @param newMaxFrameSize New maximum frame size in bytes
+         * @return Status code indicating success or failure
+         */
+        Status updateMaxFrameSize(size_t newMaxFrameSize);
 
         /**
          * @brief Get the current number of frames in the buffer

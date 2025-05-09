@@ -140,6 +140,11 @@ namespace medical::imaging {
             shmConfig.useHugePages = false; // Can be made configurable
             shmConfig.lockInMemory = config_.pinMemory;
 
+            // CRITICAL: Calculate max frame size to ensure it can handle 4K frames
+            // 4K UHD (3840x2160) with 2 bytes per pixel (YUV) = 16,588,800 bytes
+            // Add a safety buffer
+            shmConfig.maxFrameSize = 17 * 1024 * 1024; // 17MB per frame
+
             // Create the shared memory object
             sharedMemory_ = std::make_shared<SharedMemory>(shmConfig);
 

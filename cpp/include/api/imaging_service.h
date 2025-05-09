@@ -69,6 +69,8 @@ namespace medical::imaging {
             bool enablePerformanceMonitoring; // Track detailed performance metrics
             bool logPerformanceStats;       // Log performance stats periodically
             int performanceLogIntervalMs;   // Interval for logging performance
+            size_t maxFrameSize;          // Maximum size of a single frame in bytes
+
 
             // Constructor with default values
             Config() : deviceId(""),
@@ -84,7 +86,8 @@ namespace medical::imaging {
                        dropFramesWhenFull(true),
                        enablePerformanceMonitoring(true),
                        logPerformanceStats(false),
-                       performanceLogIntervalMs(5000) {
+                       performanceLogIntervalMs(5000),
+                       maxFrameSize(1024 * 1024 * 8){
             }
         };
 

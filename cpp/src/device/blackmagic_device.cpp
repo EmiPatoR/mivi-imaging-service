@@ -81,68 +81,131 @@ namespace medical::imaging {
                                                    ? bmdFormat8BitBGRA
                                                    : bmdFormat8BitYUV;
 
-            // Check if resolution or pixel format actually changed to avoid repeated restarts
-            bool resolutionChanged = false;
-            bool formatChanged = false; {
-                std::unique_lock<std::mutex> lock(device_->mutex_);
-                resolutionChanged = (device_->currentConfig_.width != width ||
-                                     device_->currentConfig_.height != height);
+            // Get display mode ID
+            BMDDisplayMode displayModeId = displayMode->GetDisplayMode();
 
-                formatChanged = (resolutionChanged ||
-                                 std::abs(device_->currentConfig_.frameRate - frameRate) > 0.1 ||
-                                 device_->currentConfig_.pixelFormat != device_->getPixelFormatString(pixelFormat));
+            // CRITICAL: Lock for thread safety
+            std::unique_lock<std::mutex> lock(device_->mutex_);
 
-                if (formatChanged) {
-                    std::cout << "Video format changed: " << width << "x" << height
-                            << " @ " << frameRate << " fps, format: "
-                            << device_->getPixelFormatString(pixelFormat) << std::endl;
+            // Track duplicate events
+            static BMDDisplayMode lastDisplayModeId = 0;
+            static auto lastChangeTime = std::chrono::steady_clock::now();
+            auto currentTime = std::chrono::steady_clock::now();
 
-                    // Update the current configuration
-                    device_->currentConfig_.width = width;
-                    device_->currentConfig_.height = height;
-                    device_->currentConfig_.frameRate = frameRate;
-                    device_->currentConfig_.pixelFormat = device_->getPixelFormatString(pixelFormat);
-                }
+            // Ignore duplicate format changes within 2 seconds
+            bool isDuplicateChange = (displayModeId == lastDisplayModeId) &&
+                                     (std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastChangeTime).
+                                      count() < 2);
+
+            if (isDuplicateChange) {
+                std::cout << "Ignoring duplicate format change event for mode ID: " << displayModeId
+                        << " (received within 2 seconds of last change)" << std::endl;
+                return S_OK;
             }
 
-            // Only restart if format actually changed and we're capturing
-            if (formatChanged && device_->isCapturing_) {
-                std::cout << "Restarting capture with new format" << std::endl;
-                device_->deckLinkInput_->StopStreams();
+            // Update tracking variables
+            lastDisplayModeId = displayModeId;
+            lastChangeTime = currentTime;
 
-                // Enable the new input format
-                device_->deckLinkInput_->EnableVideoInput(
-                    displayMode->GetDisplayMode(), pixelFormat, bmdVideoInputEnableFormatDetection);
+            // Check if resolution or pixel format actually changed
+            bool resolutionChanged = (device_->currentConfig_.width != width ||
+                                      device_->currentConfig_.height != height);
 
-                // If resolution or pixel format changed, we need to reinitialize the buffer pool
-                if (resolutionChanged) {
-                    std::lock_guard<std::mutex> poolLock(device_->bufferPoolMutex_);
+            bool formatChanged = (resolutionChanged ||
+                                  std::abs(device_->currentConfig_.frameRate - frameRate) > 0.1 ||
+                                  device_->currentConfig_.pixelFormat != device_->getPixelFormatString(pixelFormat));
 
-                    // Clear any existing buffers
-                    for (auto &buffer: device_->bufferPool_) {
-                        if (buffer.memory) {
-                            free(buffer.memory);
-                            buffer.memory = nullptr;
+            if (formatChanged) {
+                std::cout << "Video format changed: " << width << "x" << height
+                        << " @ " << frameRate << " fps, format: "
+                        << device_->getPixelFormatString(pixelFormat)
+                        << " (Mode ID: " << displayModeId << ")" << std::endl;
+
+                // Update the current configuration
+                device_->currentConfig_.width = width;
+                device_->currentConfig_.height = height;
+                device_->currentConfig_.frameRate = frameRate;
+                device_->currentConfig_.pixelFormat = device_->getPixelFormatString(pixelFormat);
+
+                // Only restart if capture is active
+                if (device_->isCapturing_) {
+                    std::cout << "Restarting capture with new format" << std::endl;
+
+                    // Stop capture before making changes
+                    device_->deckLinkInput_->StopStreams();
+
+                    // Ensure any processing completes
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+                    // CRITICAL CHANGE: Enable video input WITH format detection flag
+                    // This is the correct order - enable input with desired flags before starting streams
+                    HRESULT result = device_->deckLinkInput_->EnableVideoInput(
+                        displayModeId, pixelFormat, bmdVideoInputEnableFormatDetection);
+
+                    if (FAILED(result)) {
+                        std::cerr << "Failed to enable video input with new format. HRESULT: 0x"
+                                << std::hex << result << std::dec << std::endl;
+                        return S_OK;
+                    }
+
+                    // Release lock while updating buffer pool
+                    lock.unlock();
+
+                    // If resolution changed, reinitialize buffer pool
+                    if (resolutionChanged) {
+                        std::lock_guard<std::mutex> poolLock(device_->bufferPoolMutex_);
+
+                        // Mark all buffers as not in use
+                        for (auto &buffer: device_->bufferPool_) {
+                            buffer.inUse = false;
+                        }
+
+                        // Wait for in-process frames
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                        // Clear existing buffers
+                        for (auto &buffer: device_->bufferPool_) {
+                            if (buffer.memory) {
+                                free(buffer.memory);
+                                buffer.memory = nullptr;
+                            }
+                        }
+
+                        // Calculate new buffer size
+                        size_t newBufferSize = width * height *
+                                               (device_->currentConfig_.pixelFormat == "YUV" ? 2 : 4);
+
+                        std::cout << "Reinitializing buffer pool with new size: " << newBufferSize
+                                << " bytes for " << device_->bufferPool_.size() << " buffers" << std::endl;
+
+                        // Reinitialize buffers
+                        for (size_t i = 0; i < device_->bufferPool_.size(); ++i) {
+                            device_->bufferPool_[i].memory = malloc(newBufferSize);
+                            if (!device_->bufferPool_[i].memory) {
+                                std::cerr << "ERROR: Failed to allocate buffer memory" << std::endl;
+                                continue;
+                            }
+                            device_->bufferPool_[i].size = newBufferSize;
+                            device_->bufferPool_[i].inUse = false;
                         }
                     }
 
-                    // Calculate new buffer size based on new resolution
-                    size_t newBufferSize = width * height *
-                                           (device_->currentConfig_.pixelFormat == "YUV" ? 2 : 4);
+                    // Reacquire lock
+                    lock.lock();
 
-                    std::cout << "Reinitializing buffer pool with new size: " << newBufferSize
-                            << " bytes for " << device_->bufferPool_.size() << " buffers" << std::endl;
-
-                    // Reinitialize buffer pool with new size
-                    for (size_t i = 0; i < device_->bufferPool_.size(); ++i) {
-                        device_->bufferPool_[i].memory = malloc(newBufferSize);
-                        device_->bufferPool_[i].size = newBufferSize;
-                        device_->bufferPool_[i].inUse = false;
+                    // RESTART STREAMS - Format detection is already enabled
+                    result = device_->deckLinkInput_->StartStreams();
+                    if (FAILED(result)) {
+                        std::cerr << "Failed to restart streams after format change. HRESULT: 0x"
+                                << std::hex << result << std::dec << std::endl;
+                    } else {
+                        std::cout << "Successfully restarted streams with new format" << std::endl;
                     }
-                }
 
-                // Restart the streams
-                device_->deckLinkInput_->StartStreams();
+                    // REMOVED: The problematic re-enabling of format detection after StartStreams
+                }
+            } else {
+                std::cout << "Ignoring format change event - no actual format change detected" << std::endl;
             }
 
             return S_OK;
@@ -669,8 +732,8 @@ namespace medical::imaging {
         std::unique_lock<std::mutex> lock(mutex_);
         if (width != currentConfig_.width || height != currentConfig_.height) {
             std::cerr << "Warning: Frame dimensions mismatch! Expected: "
-                     << currentConfig_.width << "x" << currentConfig_.height
-                     << ", Received: " << width << "x" << height << std::endl;
+                    << currentConfig_.width << "x" << currentConfig_.height
+                    << ", Received: " << width << "x" << height << std::endl;
 
             // Update configuration to match the actual frame
             currentConfig_.width = width;
@@ -1048,8 +1111,13 @@ namespace medical::imaging {
         return capabilities_.supportsGpuDirect;
     }
 
-    // In BlackmagicDevice::initializeBufferPool, add proper thread safety:
+
     bool BlackmagicDevice::initializeBufferPool(size_t bufferCount, size_t bufferSize) {
+        if (bufferCount == 0 || bufferSize == 0) {
+            std::cerr << "Invalid buffer count or size" << std::endl;
+            return false;
+        }
+
         std::lock_guard<std::mutex> lock(bufferPoolMutex_);
 
         // Clear existing pool
@@ -1067,10 +1135,12 @@ namespace medical::imaging {
 
         for (size_t i = 0; i < bufferCount; ++i) {
             Buffer &buffer = bufferPool_[i];
-            buffer.memory = malloc(bufferSize);
+            // Use calloc instead of malloc to ensure memory is initialized to zeros
+            buffer.memory = calloc(1, bufferSize);
 
             if (!buffer.memory) {
                 // Allocation failed - clean up
+                std::cerr << "Failed to allocate buffer " << i << " of size " << bufferSize << std::endl;
                 for (size_t j = 0; j < i; ++j) {
                     free(bufferPool_[j].memory);
                     bufferPool_[j].memory = nullptr;
@@ -1085,6 +1155,7 @@ namespace medical::imaging {
             buffer.isExternal = false;
         }
 
+        std::cout << "Buffer pool initialized with " << bufferCount << " buffers of size " << bufferSize << " bytes" << std::endl;
         return true;
     }
 

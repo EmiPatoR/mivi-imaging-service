@@ -278,6 +278,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    config.deviceConfig.bufferCount = 16; // Increase from 3 to 6
+    config.sharedMemorySize = 512 * 1024 * 1024; // 512 MB instead of 128 MB
+    //config.maxFrameSize = 17 * 1024 * 1024; // 17MB per frame
+
     // Set process priority
     if (!setProcessPriority(niceValue)) {
         std::cerr << "Failed to set nice value: " << niceValue << std::endl;

@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package medical.imaging;
+
+// The Imaging Service provides access to ultrasound imaging data and controls
+service ImagingService {
+  // Get information about the service and connected devices
+  rpc GetServiceInfo (ServiceInfoRequest) returns (ServiceInfoResponse);
+
+  // Get a list of available devices
+  rpc GetAvailableDevices (DeviceListRequest) returns (DeviceListResponse);
+
+  // Control the imaging device
+  rpc ControlDevice (DeviceControlRequest) returns (DeviceControlResponse);
+
+  // Stream the ultrasound frames with metadata
+  rpc StreamFrames (FrameRequest) returns (stream FrameResponse);
+
+  // Get a single frame on demand
+  rpc GetFrame (FrameRequest) returns (FrameResponse);
+
+  // Stream segmentation results
+  rpc StreamSegmentation (SegmentationRequest) returns (stream SegmentationResponse);
+
+  // Get the 3D reconstruction status and progress
+  rpc GetReconstructionStatus (ReconstructionStatusRequest) returns (ReconstructionStatusResponse);
+
+  // Get statistics about service operation
+  rpc GetStatistics (StatisticsRequest) returns (StatisticsResponse);
+}
+
+// Request for service information
+message ServiceInfoRequest {
+  // No parameters needed
+}
+
+// Response with service information
+message ServiceInfoResponse {
+  string service_version = 1;
+  string sdk_version = 2;
+  string current_device_id = 3;
+  DeviceInfo current_device = 4;
+  bool is_capturing = 5;
+  FrameFormat current_format = 6;
+  map<string, string> additional_info = 7;
+}
+
+// Request for device list
+message DeviceListRequest {
+  // No parameters needed
+}
+
+// Response with list of available devices
+message DeviceListResponse {
+  repeated DeviceInfo devices = 1;
+}
+
+// Device information
+message DeviceInfo {
+  string device_id = 1;
+  string device_name = 2;
+  string device_model = 3;
+  repeated FrameFormat supported_formats = 4;
+  bool is_connected = 5;
+  bool is_active = 6;
+}
+
+// Frame format description
+message FrameFormat {
+  int32 width = 1;
+  int32 height = 2;
+  double frame_rate = 3;
+  string pixel_format = 4;
+  bool supports_audio = 5;
+}
+
+// Request to control the device
+message DeviceControlRequest {
+  string command = 1;  // start, stop, initialize, reset, etc.
+  map<string, string> parameters = 2;  // Command-specific parameters
+}
+
+// Response to device control request
+message DeviceControlResponse {
+  bool success = 1;
+  string message = 2;
+  map<string, string> additional_info = 3;
+}
+
+// Request for frames
+message FrameRequest {
+  bool include_image_data = 1;  // Whether to include raw image data or just metadata
+  bool include_audio_data = 2;  // Whether to include audio data
+  int32 quality = 3;            // Compression quality (0-100, 0 = max compression)
+  string format = 4;            // Requested output format (e.g., "jpeg", "raw")
+}
+
+// Response with frame data
+message FrameResponse {
+  uint64 frame_id = 1;
+  int64 timestamp = 2;  // nanoseconds since epoch
+  FrameMetadata metadata = 3;
+  bytes image_data = 4;  // Raw or compressed image data
+  bytes audio_data = 5;  // Optional audio data
+}
+
+// Frame metadata
+message FrameMetadata {
+  int32 width = 1;
+  int32 height = 2;
+  string format = 3;
+  int32 bytes_per_pixel = 4;
+  uint64 sequence_number = 5;
+  map<string, string> additional_metadata = 6;
+}
+
+// Request for segmentation data
+message SegmentationRequest {
+  bool include_mask = 1;  // Whether to include segmentation mask
+  bool include_contours = 2;  // Whether to include contour points
+}
+
+// Response with segmentation results
+message SegmentationResponse {
+  uint64 frame_id = 1;
+  int64 timestamp = 2;  // nanoseconds since epoch
+  float confidence = 3;  // Segmentation confidence (0.0-1.0)
+  bytes mask_data = 4;   // Segmentation mask (RLE encoded)
+  repeated Contour contours = 5;  // Contours of detected thyroid
+}
+
+// Contour points for segmentation
+message Contour {
+  string label = 1;  // e.g., "thyroid_left", "thyroid_right"
+  repeated Point points = 2;
+}
+
+// 2D point
+message Point {
+  float x = 1;
+  float y = 2;
+}
+
+// Request for reconstruction status
+message ReconstructionStatusRequest {
+  // No parameters needed
+}
+
+// Response with reconstruction status
+message ReconstructionStatusResponse {
+  bool reconstruction_active = 1;
+  float completion_percentage = 2;  // 0.0-100.0
+  int32 frames_processed = 3;
+  int32 total_frames = 4;
+  float estimated_remaining_seconds = 5;
+  string status_message = 6;
+  repeated string warnings = 7;
+}
+
+// Request for statistics
+message StatisticsRequest {
+  repeated string requested_stats = 1;  // Empty array means all stats
+}
+
+// Response with statistics
+message StatisticsResponse {
+  map<string, string> statistics = 1;  // Key-value pairs of statistics
+  int64 timestamp = 2;  // nanoseconds since epoch
+}

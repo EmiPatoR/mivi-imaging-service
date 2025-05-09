@@ -9,6 +9,7 @@
 #include <thread>
 #include <sys/mman.h>
 #include <cmath>
+#include <fcntl.h>
 #include <iomanip>
 #include <numeric>
 
@@ -17,7 +18,7 @@ namespace medical::imaging {
      * @brief Enhanced implementation of IDeckLinkInputCallback for frame callbacks
      *
      * This callback implementation supports zero-copy frame acquisition and
-     * DMA where possible.
+     * DMA where possible, with improved handling of format changes.
      */
     class BlackmagicDevice::InputCallback final : public IDeckLinkInputCallback {
     public:
@@ -57,6 +58,7 @@ namespace medical::imaging {
             return S_OK;
         }
 
+
         HRESULT STDMETHODCALLTYPE VideoInputFormatChanged(
             BMDVideoInputFormatChangedEvents events,
             IDeckLinkDisplayMode *displayMode,
@@ -79,21 +81,67 @@ namespace medical::imaging {
                                                    ? bmdFormat8BitBGRA
                                                    : bmdFormat8BitYUV;
 
-            // Update the current configuration
-            std::unique_lock<std::mutex> lock(device_->mutex_);
-            device_->currentConfig_.width = width;
-            device_->currentConfig_.height = height;
-            device_->currentConfig_.frameRate = frameRate;
-            device_->currentConfig_.pixelFormat = device_->getPixelFormatString(pixelFormat);
+            // Check if resolution or pixel format actually changed to avoid repeated restarts
+            bool resolutionChanged = false;
+            bool formatChanged = false; {
+                std::unique_lock<std::mutex> lock(device_->mutex_);
+                resolutionChanged = (device_->currentConfig_.width != width ||
+                                     device_->currentConfig_.height != height);
 
-            // If we're capturing, we need to stop and restart with the new format
-            if (device_->isCapturing_) {
+                formatChanged = (resolutionChanged ||
+                                 std::abs(device_->currentConfig_.frameRate - frameRate) > 0.1 ||
+                                 device_->currentConfig_.pixelFormat != device_->getPixelFormatString(pixelFormat));
+
+                if (formatChanged) {
+                    std::cout << "Video format changed: " << width << "x" << height
+                            << " @ " << frameRate << " fps, format: "
+                            << device_->getPixelFormatString(pixelFormat) << std::endl;
+
+                    // Update the current configuration
+                    device_->currentConfig_.width = width;
+                    device_->currentConfig_.height = height;
+                    device_->currentConfig_.frameRate = frameRate;
+                    device_->currentConfig_.pixelFormat = device_->getPixelFormatString(pixelFormat);
+                }
+            }
+
+            // Only restart if format actually changed and we're capturing
+            if (formatChanged && device_->isCapturing_) {
+                std::cout << "Restarting capture with new format" << std::endl;
                 device_->deckLinkInput_->StopStreams();
 
                 // Enable the new input format
                 device_->deckLinkInput_->EnableVideoInput(
                     displayMode->GetDisplayMode(), pixelFormat, bmdVideoInputEnableFormatDetection);
 
+                // If resolution or pixel format changed, we need to reinitialize the buffer pool
+                if (resolutionChanged) {
+                    std::lock_guard<std::mutex> poolLock(device_->bufferPoolMutex_);
+
+                    // Clear any existing buffers
+                    for (auto &buffer: device_->bufferPool_) {
+                        if (buffer.memory) {
+                            free(buffer.memory);
+                            buffer.memory = nullptr;
+                        }
+                    }
+
+                    // Calculate new buffer size based on new resolution
+                    size_t newBufferSize = width * height *
+                                           (device_->currentConfig_.pixelFormat == "YUV" ? 2 : 4);
+
+                    std::cout << "Reinitializing buffer pool with new size: " << newBufferSize
+                            << " bytes for " << device_->bufferPool_.size() << " buffers" << std::endl;
+
+                    // Reinitialize buffer pool with new size
+                    for (size_t i = 0; i < device_->bufferPool_.size(); ++i) {
+                        device_->bufferPool_[i].memory = malloc(newBufferSize);
+                        device_->bufferPool_[i].size = newBufferSize;
+                        device_->bufferPool_[i].inUse = false;
+                    }
+                }
+
+                // Restart the streams
                 device_->deckLinkInput_->StartStreams();
             }
 
@@ -294,6 +342,11 @@ namespace medical::imaging {
             initializeBufferPool(config.bufferCount, bufferSize);
         }
 
+        // Print what we're about to do
+        std::cout << "Enabling video input: " << config.width << "x" << config.height
+                << " @ " << config.frameRate << "fps with format " << config.pixelFormat << std::endl;
+        std::cout << "Display mode: " << displayMode->GetDisplayMode() << std::endl;
+
         // Enable the input
         HRESULT result = deckLinkInput_->EnableVideoInput(
             displayMode->GetDisplayMode(), pixelFormat, flags);
@@ -301,6 +354,8 @@ namespace medical::imaging {
         displayMode->Release();
 
         if (FAILED(result)) {
+            std::cerr << "Failed to enable video input. HRESULT: 0x"
+                    << std::hex << result << std::dec << std::endl;
             return Status::INIT_FAILED;
         }
 
@@ -310,6 +365,8 @@ namespace medical::imaging {
                 bmdAudioSampleRate48kHz, bmdAudioSampleType16bitInteger, 2);
 
             if (FAILED(result)) {
+                std::cerr << "Failed to enable audio input. HRESULT: 0x"
+                        << std::hex << result << std::dec << std::endl;
                 deckLinkInput_->DisableVideoInput();
                 return Status::INIT_FAILED;
             }
@@ -320,6 +377,7 @@ namespace medical::imaging {
 
         return Status::OK;
     }
+
 
     BlackmagicDevice::Status BlackmagicDevice::startCapture(
         std::function<void(std::shared_ptr<Frame>)> frameCallback) {
@@ -344,8 +402,11 @@ namespace medical::imaging {
         fpsHistory_.clear();
 
         // Start the streams
+        std::cout << "Starting capture streams..." << std::endl;
         HRESULT result = deckLinkInput_->StartStreams();
         if (FAILED(result)) {
+            std::cerr << "Failed to start streams. HRESULT: 0x"
+                    << std::hex << result << std::dec << std::endl;
             return Status::INTERNAL_ERROR;
         }
 
@@ -367,6 +428,8 @@ namespace medical::imaging {
         // Stop the streams
         HRESULT result = deckLinkInput_->StopStreams();
         if (FAILED(result)) {
+            std::cerr << "Failed to stop streams. HRESULT: 0x"
+                    << std::hex << result << std::dec << std::endl;
             return Status::INTERNAL_ERROR;
         }
 
@@ -601,6 +664,19 @@ namespace medical::imaging {
         long rowBytes = videoFrame->GetRowBytes();
         BMDPixelFormat pixelFormat = videoFrame->GetPixelFormat();
         size_t dataSize = height * rowBytes;
+
+        // SAFETY CHECK: Verify frame dimensions match our expectations
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (width != currentConfig_.width || height != currentConfig_.height) {
+            std::cerr << "Warning: Frame dimensions mismatch! Expected: "
+                     << currentConfig_.width << "x" << currentConfig_.height
+                     << ", Received: " << width << "x" << height << std::endl;
+
+            // Update configuration to match the actual frame
+            currentConfig_.width = width;
+            currentConfig_.height = height;
+        }
+        lock.unlock();
 
         // Get frame data using IDeckLinkVideoBuffer interface
         void *frameBytes = nullptr;
@@ -972,10 +1048,18 @@ namespace medical::imaging {
         return capabilities_.supportsGpuDirect;
     }
 
+    // In BlackmagicDevice::initializeBufferPool, add proper thread safety:
     bool BlackmagicDevice::initializeBufferPool(size_t bufferCount, size_t bufferSize) {
         std::lock_guard<std::mutex> lock(bufferPoolMutex_);
 
         // Clear existing pool
+        for (auto& buffer : bufferPool_) {
+            if (buffer.memory) {
+                free(buffer.memory);
+                buffer.memory = nullptr;
+            }
+        }
+
         bufferPool_.clear();
 
         // Allocate buffers
@@ -986,8 +1070,7 @@ namespace medical::imaging {
             buffer.memory = malloc(bufferSize);
 
             if (!buffer.memory) {
-                // Allocation failed
-                // Clean up what we've allocated so far
+                // Allocation failed - clean up
                 for (size_t j = 0; j < i; ++j) {
                     free(bufferPool_[j].memory);
                     bufferPool_[j].memory = nullptr;

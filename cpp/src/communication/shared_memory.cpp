@@ -863,7 +863,7 @@ namespace medical::imaging {
         }
     };
 
-    // SharedMemory implementation
+    // Constructor with enhanced initialization
     SharedMemory::SharedMemory(const Config &config)
         : impl_(std::make_unique<Impl>()),
           config_(config),

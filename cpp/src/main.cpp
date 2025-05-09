@@ -5,6 +5,9 @@
 #include <thread>
 #include <atomic>
 #include <iomanip>
+#include <chrono>
+#include <fstream>
+#include <sys/resource.h>
 
 // Global variables
 std::atomic<bool> g_running(true);
@@ -47,6 +50,8 @@ void printUsage(const char* programName) {
     std::cout << "  --no-drop-frames           Don't drop frames when buffer is full\n";
     std::cout << "  --enable-logging           Enable performance logging\n";
     std::cout << "  --log-interval <ms>        Log interval in ms (default: 5000)\n";
+    std::cout << "  --diagnostics-file <path>  Path to write diagnostics (default: none)\n";
+    std::cout << "  --nice-value <value>       Process nice value (-20 to 19, default: -10)\n";
     std::cout << "  --help                     Show this help message\n";
 }
 
@@ -161,12 +166,48 @@ void printDevices(const std::vector<std::string>& deviceIds,
     std::cout << "└─────────────────────────────────────────────────────────┘\n\n";
 }
 
+// New function to set process scheduling priority
+bool setProcessPriority(int niceValue) {
+    // Set nice value (process priority)
+    int result = setpriority(PRIO_PROCESS, 0, niceValue);
+    if (result != 0) {
+        std::cerr << "Failed to set nice value: " << errno << std::endl;
+        return false;
+    }
+
+    std::cout << "Process priority set to nice value: " << niceValue << std::endl;
+    return true;
+}
+
+// New function to write diagnostics to a file periodically
+void writeDiagnostics(const std::string& filePath,
+                     const medical::imaging::ImagingService& service) {
+    if (filePath.empty()) {
+        return;
+    }
+
+    static auto lastWriteTime = std::chrono::system_clock::now();
+    auto now = std::chrono::system_clock::now();
+
+    // Write every 30 seconds
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastWriteTime).count() >= 30) {
+        service.dumpDiagnostics(filePath);
+        lastWriteTime = now;
+    }
+}
+
 int main(int argc, char *argv[]) {
     // Register signal handler
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
 
     printBanner();
+
+    // Default nice value
+    int niceValue = -10;
+
+    // Diagnostics file path
+    std::string diagnosticsFile;
 
     // Create the imaging service
     medical::imaging::ImagingService service;
@@ -221,6 +262,12 @@ int main(int argc, char *argv[]) {
             config.logPerformanceStats = true;
         } else if (arg == "--log-interval" && i + 1 < argc) {
             config.performanceLogIntervalMs = std::stoi(argv[++i]);
+        } else if (arg == "--diagnostics-file" && i + 1 < argc) {
+            diagnosticsFile = argv[++i];
+        } else if (arg == "--nice-value" && i + 1 < argc) {
+            niceValue = std::stoi(argv[++i]);
+            // Clamp to valid range
+            niceValue = std::max(-20, std::min(19, niceValue));
         } else if (arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -229,6 +276,11 @@ int main(int argc, char *argv[]) {
             printUsage(argv[0]);
             return 1;
         }
+    }
+
+    // Set process priority
+    if (!setProcessPriority(niceValue)) {
+        std::cerr << "Failed to set nice value: " << niceValue << std::endl;
     }
 
     // List available devices
@@ -252,25 +304,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Set a frame callback for logging
-    service.setFrameCallback([](const std::shared_ptr<medical::imaging::Frame>& frame) {
-        static uint64_t count = 0;
-        static auto lastLogTime = std::chrono::steady_clock::now();
-
-        count++;
-
-        // Log stats every second
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLogTime).count() >= 1) {
-            std::cout << "Processed " << count << " frames, latest: "
-                    << frame->getWidth() << "x" << frame->getHeight()
-                    << " " << frame->getFormat() << std::endl;
-
-            count = 0;
-            lastLogTime = now;
-        }
-    });
-
     // Start the service
     std::cout << "Starting imaging service..." << std::endl;
     status = service.start();
@@ -286,6 +319,15 @@ int main(int argc, char *argv[]) {
     std::cout << "Other services can now connect to this shared memory to process frames." << std::endl;
     std::cout << std::endl;
 
+    // Create a file to signal that the service is ready
+    if (!diagnosticsFile.empty()) {
+        std::ofstream readyFile("/tmp/imaging_service_ready");
+        if (readyFile.is_open()) {
+            readyFile << "ready" << std::endl;
+            readyFile.close();
+        }
+    }
+
     // Main loop
     while (g_running) {
         // Sleep briefly
@@ -294,6 +336,11 @@ int main(int argc, char *argv[]) {
         // Print statistics
         auto stats = service.getStatistics();
         printStatistics(stats);
+
+        // Write diagnostics if enabled
+        if (!diagnosticsFile.empty()) {
+            writeDiagnostics(diagnosticsFile, service);
+        }
     }
 
     // Stop the service
@@ -303,6 +350,11 @@ int main(int argc, char *argv[]) {
     if (status != medical::imaging::ImagingService::Status::OK) {
         std::cerr << "Failed to stop imaging service (error code: " << static_cast<int>(status) << ")" << std::endl;
         return 1;
+    }
+
+    // Remove ready file if it exists
+    if (!diagnosticsFile.empty()) {
+        std::remove("/tmp/imaging_service_ready");
     }
 
     std::cout << "Service stopped." << std::endl;

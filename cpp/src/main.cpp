@@ -42,24 +42,12 @@ int main(int argc, char *argv[]) {
             config.deviceConfig.frameRate = std::stod(argv[++i]);
         } else if (arg == "--pixel-format" && i + 1 < argc) {
             config.deviceConfig.pixelFormat = argv[++i];
-        } else if (arg == "--no-segmentation") {
-            config.enableSegmentation = false;
-        } else if (arg == "--no-calibration") {
-            config.enableCalibration = false;
-        } else if (arg == "--threads" && i + 1 < argc) {
-            config.processingThreads = std::stoi(argv[++i]);
         } else if (arg == "--no-shared-memory") {
             config.enableSharedMemory = false;
         } else if (arg == "--shared-memory-name" && i + 1 < argc) {
             config.sharedMemoryName = argv[++i];
         } else if (arg == "--shared-memory-size" && i + 1 < argc) {
             config.sharedMemorySize = std::stoull(argv[++i]);
-        } else if (arg == "--no-grpc") {
-            config.enableGrpc = false;
-        } else if (arg == "--grpc-address" && i + 1 < argc) {
-            config.grpcServerAddress = argv[++i];
-        } else if (arg == "--grpc-port" && i + 1 < argc) {
-            config.grpcServerPort = std::stoi(argv[++i]);
         } else if (arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
             std::cout << "Options:" << std::endl;
@@ -81,8 +69,6 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
-    config.processingThreads = std::thread::hardware_concurrency();
-
 
     // List available devices
     auto &deviceManager = medical::imaging::DeviceManager::getInstance();

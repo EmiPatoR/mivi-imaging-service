@@ -1,5 +1,4 @@
 #include "device/device_manager.h"
-#include "device/blackmagic_device.h"
 #include "DeckLinkAPI.h"
 #include "utils/refiid_compare.h"
 #include <iostream>
@@ -147,7 +146,7 @@ std::vector<std::string> DeviceManager::getAvailableDeviceIds() {
     return deviceIds;
 }
 
-std::shared_ptr<UltrasoundDevice> DeviceManager::getDevice(const std::string& deviceId) {
+std::shared_ptr<BlackmagicDevice> DeviceManager::getDevice(const std::string& deviceId) {
     std::unique_lock<std::mutex> lock(mutex_);
 
     auto it = devices_.find(deviceId);
@@ -179,7 +178,7 @@ bool DeviceManager::unregisterDeviceChangeCallback(int subscriptionId) {
     return false;
 }
 
-void DeviceManager::addTestDevice(std::shared_ptr<UltrasoundDevice> device) {
+void DeviceManager::addTestDevice(std::shared_ptr<BlackmagicDevice> device) {
     if (!device) {
         return;
     }
@@ -224,7 +223,7 @@ void DeviceManager::deviceRemoved(void* deckLinkDevice) {
     {
         std::unique_lock<std::mutex> lock(mutex_);
         for (auto it = devices_.begin(); it != devices_.end(); ++it) {
-            auto blackmagicDevice = std::dynamic_pointer_cast<BlackmagicDevice>(it->second);
+            auto blackmagicDevice = it->second;
             if (blackmagicDevice) {
                 // Use the device ID which includes the pointer value
                 if (blackmagicDevice->getDeviceId().find(
@@ -243,7 +242,7 @@ void DeviceManager::deviceRemoved(void* deckLinkDevice) {
     }
 }
 
-void DeviceManager::addDeviceSafe(const std::string& deviceId, std::shared_ptr<UltrasoundDevice> device) {
+void DeviceManager::addDeviceSafe(const std::string& deviceId, std::shared_ptr<BlackmagicDevice> device) {
     // Local copies for callbacks
     std::vector<std::function<void(const std::string&, bool)>> callbacksToCall;
 

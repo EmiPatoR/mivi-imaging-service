@@ -93,7 +93,7 @@ namespace medical::imaging {
         }
 
         // Set up device configuration
-        UltrasoundDevice::Config deviceConfig = config_.deviceConfig;
+        BlackmagicDevice::Config deviceConfig = config_.deviceConfig;
 
         // Apply additional configuration options
         deviceConfig.enableDirectMemoryAccess = config_.enableDirectMemoryAccess;
@@ -104,11 +104,28 @@ namespace medical::imaging {
         }
 
         // Initialize the device
-        if (device_->initialize(deviceConfig) != UltrasoundDevice::Status::OK) {
+        if (device_->initialize(deviceConfig) != BlackmagicDevice::Status::OK) {
             return Status::DEVICE_ERROR;
         }
 
         return Status::OK;
+    }
+
+    // Static methods using the DeviceManager directly
+    std::vector<std::string> ImagingService::getAvailableDevices() {
+        auto &deviceManager = DeviceManager::getInstance();
+        return deviceManager.getAvailableDeviceIds();
+    }
+
+    int ImagingService::registerDeviceChangeCallback(
+        const std::function<void(const std::string &, bool)> &callback) {
+        auto &deviceManager = DeviceManager::getInstance();
+        return deviceManager.registerDeviceChangeCallback(callback);
+    }
+
+    bool ImagingService::unregisterDeviceChangeCallback(int subscriptionId) {
+        auto &deviceManager = DeviceManager::getInstance();
+        return deviceManager.unregisterDeviceChangeCallback(subscriptionId);
     }
 
     ImagingService::Status ImagingService::setupSharedMemory() {
@@ -190,7 +207,7 @@ namespace medical::imaging {
                 handleNewFrame(frame);
             });
 
-        if (status != UltrasoundDevice::Status::OK) {
+        if (status != BlackmagicDevice::Status::OK) {
             // Clean up performance thread if it was started
             if (config_.enablePerformanceMonitoring) {
                 stopRequested_ = true;
@@ -213,7 +230,7 @@ namespace medical::imaging {
 
         // Stop the device
         auto status = device_->stopCapture();
-        if (status != UltrasoundDevice::Status::OK) {
+        if (status != BlackmagicDevice::Status::OK) {
             return Status::DEVICE_ERROR;
         }
 
@@ -319,22 +336,6 @@ namespace medical::imaging {
         }
 
         return stats;
-    }
-
-    std::vector<std::string> ImagingService::getAvailableDevices() {
-        auto &deviceManager = DeviceManager::getInstance();
-        return deviceManager.getAvailableDeviceIds();
-    }
-
-    int ImagingService::registerDeviceChangeCallback(
-        const std::function<void(const std::string &, bool)> &callback) {
-        auto &deviceManager = DeviceManager::getInstance();
-        return deviceManager.registerDeviceChangeCallback(callback);
-    }
-
-    bool ImagingService::unregisterDeviceChangeCallback(int subscriptionId) {
-        auto &deviceManager = DeviceManager::getInstance();
-        return deviceManager.unregisterDeviceChangeCallback(subscriptionId);
     }
 
     std::shared_ptr<SharedMemory> ImagingService::getSharedMemory() const {

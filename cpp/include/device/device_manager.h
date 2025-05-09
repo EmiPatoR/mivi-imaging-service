@@ -7,17 +7,17 @@
 #include <map>
 #include <mutex>
 
-#include "device/ultrasound_device.h"
+#include "device/blackmagic_device.h"
 
 namespace medical {
 namespace imaging {
 
 /**
  * @class DeviceManager
- * @brief Manages ultrasound imaging devices, handling discovery and lifecycle
- * 
+ * @brief Manages Blackmagic imaging devices, handling discovery and lifecycle
+ *
  * This class is responsible for discovering, initializing, and managing
- * available ultrasound imaging devices in the system. It serves as the entry
+ * available Blackmagic imaging devices in the system. It serves as the entry
  * point for applications to access imaging hardware.
  */
 class DeviceManager {
@@ -33,7 +33,7 @@ public:
      * @return Number of devices found
      */
     int discoverDevices();
-    
+
     /**
      * @brief Get a list of all available device IDs
      * @return Vector of device IDs
@@ -45,7 +45,7 @@ public:
      * @param deviceId The ID of the device to retrieve
      * @return Shared pointer to the device, or nullptr if not found
      */
-    std::shared_ptr<UltrasoundDevice> getDevice(const std::string& deviceId);
+    std::shared_ptr<BlackmagicDevice> getDevice(const std::string& deviceId);
 
     /**
      * @brief Register a callback for device hot-plug events
@@ -63,7 +63,7 @@ public:
     bool unregisterDeviceChangeCallback(int subscriptionId);
 
     // Test method to add a device manually
-    void addTestDevice(std::shared_ptr<UltrasoundDevice> device);
+    void addTestDevice(std::shared_ptr<BlackmagicDevice> device);
 
     // Prevent copy and assignment
     DeviceManager(const DeviceManager&) = delete;
@@ -76,7 +76,7 @@ private:
     class DeviceNotificationCallback;  // Forward declaration for BMD callback
 
     // Private implementation details
-    std::map<std::string, std::shared_ptr<UltrasoundDevice>> devices_;
+    std::map<std::string, std::shared_ptr<BlackmagicDevice>> devices_;
     std::map<int, std::function<void(const std::string&, bool)>> callbacks_;
     int nextCallbackId_;
     mutable std::mutex mutex_;
@@ -88,7 +88,7 @@ private:
     void deviceRemoved(void* deckLinkDevice);
 
     // Thread-safe way to add a device
-    void addDeviceSafe(const std::string& deviceId, std::shared_ptr<UltrasoundDevice> device);
+    void addDeviceSafe(const std::string& deviceId, std::shared_ptr<BlackmagicDevice> device);
 
     // Thread-safe way to remove a device
     void removeDeviceSafe(const std::string& deviceId);

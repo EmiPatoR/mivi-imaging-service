@@ -12,44 +12,46 @@
 
 namespace medical::imaging {
     /**
-     * @brief Frame hardware buffer type
-     */
+ * @enum BufferType
+ * @brief Types of memory buffers for frames
+ */
     enum class BufferType {
-        CPU_MEMORY, // Standard system memory
-        GPU_MEMORY, // GPU device memory (CUDA/OpenCL)
-        DMA_BUFFER, // Direct Memory Access buffer
-        EXTERNAL_MEMORY // Memory managed externally
+        CPU_MEMORY,        // Standard system memory
+        GPU_MEMORY,        // GPU device memory (CUDA/OpenCL)
+        DMA_BUFFER,        // Direct Memory Access buffer
+        EXTERNAL_MEMORY    // Memory managed externally
     };
 
     /**
+     * @struct FrameMetadata
      * @brief Enhanced metadata for medical imaging frames
      */
     struct FrameMetadata {
-        uint64_t frameId = 0; // Unique frame ID
-        uint64_t timestampNs = 0; // Capture timestamp in nanoseconds
-        uint32_t width = 0; // Frame width in pixels
-        uint32_t height = 0; // Frame height in pixels
-        uint32_t bytesPerPixel = 0; // Number of bytes per pixel
-        std::string format; // Pixel format string
+        uint64_t frameId = 0;                      // Unique frame ID
+        uint64_t timestampNs = 0;                  // Capture timestamp in nanoseconds
+        uint32_t width = 0;                        // Frame width in pixels
+        uint32_t height = 0;                       // Frame height in pixels
+        uint32_t bytesPerPixel = 0;                // Number of bytes per pixel
+        std::string format;                        // Pixel format string
 
         // Acquisition metadata
-        std::string deviceId; // ID of capturing device
-        float exposureTimeMs = 0.0f; // Exposure time in milliseconds
-        uint32_t frameNumber = 0; // Sequential frame number
+        std::string deviceId;                      // ID of capturing device
+        float exposureTimeMs = 0.0f;               // Exposure time in milliseconds
+        uint32_t frameNumber = 0;                  // Sequential frame number
 
         // Processing status flags
-        bool hasBeenProcessed = false; // Whether frame has been processed
-        bool hasCalibrationData = false; // Whether frame has calibration data
-        bool hasSegmentationData = false; // Whether frame has segmentation data
+        bool hasBeenProcessed = false;             // Whether frame has been processed
+        bool hasCalibrationData = false;           // Whether frame has calibration data
+        bool hasSegmentationData = false;          // Whether frame has segmentation data
 
         // For tracking/calibration
-        std::vector<float> probePosition; // 3D probe position [x,y,z]
-        std::vector<float> probeOrientation; // Quaternion [x,y,z,w]
+        std::vector<float> probePosition;          // 3D probe position [x,y,z]
+        std::vector<float> probeOrientation;       // Quaternion [x,y,z,w]
 
         // Image quality and diagnostics
-        float signalToNoiseRatio = 0.0f; // SNR in dB
-        float signalStrength = 0.0f; // Signal strength (0.0-1.0)
-        float confidenceScore = 0.0f; // AI confidence (0.0-1.0)
+        float signalToNoiseRatio = 0.0f;           // SNR in dB
+        float signalStrength = 0.0f;               // Signal strength (0.0-1.0)
+        float confidenceScore = 0.0f;              // AI confidence (0.0-1.0)
 
         // Additional metadata as key-value pairs
         std::unordered_map<std::string, std::string> attributes;

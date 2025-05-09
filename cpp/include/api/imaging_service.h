@@ -15,7 +15,6 @@
 #include "frame/frame.h"
 #include "communication/shared_memory.h"
 
-
 namespace medical::imaging {
     /**
      * @class ImagingService
@@ -30,16 +29,16 @@ namespace medical::imaging {
          * @brief Status codes for service operations
          */
         enum class Status {
-            OK, // Operation completed successfully
-            DEVICE_ERROR, // Error with imaging device
-            PROCESSING_ERROR, // Error processing frames
+            OK,                  // Operation completed successfully
+            DEVICE_ERROR,        // Error with imaging device
+            PROCESSING_ERROR,    // Error processing frames
             COMMUNICATION_ERROR, // Error in communication
-            NOT_INITIALIZED, // Service not initialized
-            ALREADY_RUNNING, // Service already running
-            INVALID_ARGUMENT, // Invalid argument provided
-            NOT_RUNNING, // Service not running
-            INTERNAL_ERROR, // Unspecified internal error
-            TIMEOUT // Operation timed out
+            NOT_INITIALIZED,     // Service not initialized
+            ALREADY_RUNNING,     // Service already running
+            INVALID_ARGUMENT,    // Invalid argument provided
+            NOT_RUNNING,         // Service not running
+            INTERNAL_ERROR,      // Unspecified internal error
+            TIMEOUT              // Operation timed out
         };
 
         /**
@@ -47,29 +46,29 @@ namespace medical::imaging {
          */
         struct Config {
             // Device settings
-            std::string deviceId; // ID of device to use, empty for auto-select
-            UltrasoundDevice::Config deviceConfig; // Device-specific configuration
+            std::string deviceId;                   // ID of device to use, empty for auto-select
+            BlackmagicDevice::Config deviceConfig;  // Device-specific configuration
 
             // Performance settings
             bool enableDirectMemoryAccess; // Enable DMA if supported
-            bool useRealtimePriority; // Use realtime thread priority
-            int threadAffinity; // Thread CPU affinity (-1 for auto)
-            bool pinMemory; // Pin memory to RAM (prevent swapping)
+            bool useRealtimePriority;      // Use realtime thread priority
+            int threadAffinity;            // Thread CPU affinity (-1 for auto)
+            bool pinMemory;                // Pin memory to RAM (prevent swapping)
 
             // Shared memory settings
-            bool enableSharedMemory; // Enable shared memory communication
-            std::string sharedMemoryName; // Name of shared memory region
-            size_t sharedMemorySize; // Size of shared memory region
+            bool enableSharedMemory;       // Enable shared memory communication
+            std::string sharedMemoryName;  // Name of shared memory region
+            size_t sharedMemorySize;       // Size of shared memory region
             SharedMemoryType sharedMemoryType; // Type of shared memory implementation
 
             // Framebuffer settings
-            int frameBufferSize; // Number of frames to buffer
-            bool dropFramesWhenFull; // Whether to drop frames when buffer is full
+            int frameBufferSize;         // Number of frames to buffer
+            bool dropFramesWhenFull;     // Whether to drop frames when buffer is full
 
             // Diagnostics
             bool enablePerformanceMonitoring; // Track detailed performance metrics
-            bool logPerformanceStats; // Log performance stats periodically
-            int performanceLogIntervalMs; // Interval for logging performance
+            bool logPerformanceStats;       // Log performance stats periodically
+            int performanceLogIntervalMs;   // Interval for logging performance
 
             // Constructor with default values
             Config() : deviceId(""),
@@ -93,14 +92,14 @@ namespace medical::imaging {
          * @brief Performance metrics for the imaging service
          */
         struct PerformanceMetrics {
-            uint64_t frameCount; // Total frames captured
-            uint64_t droppedFrames; // Frames dropped
-            double averageFps; // Average frames per second
-            double currentFps; // Current frames per second
-            double averageLatencyMs; // Average latency in milliseconds
-            double maxLatencyMs; // Maximum latency in milliseconds
-            double cpuUsagePercent; // CPU usage percentage
-            double memoryUsageMb; // Memory usage in MB
+            uint64_t frameCount;       // Total frames captured
+            uint64_t droppedFrames;    // Frames dropped
+            double averageFps;         // Average frames per second
+            double currentFps;         // Current frames per second
+            double averageLatencyMs;   // Average latency in milliseconds
+            double maxLatencyMs;       // Maximum latency in milliseconds
+            double cpuUsagePercent;    // CPU usage percentage
+            double memoryUsageMb;      // Memory usage in MB
             std::chrono::seconds uptime; // Service uptime
         };
 
@@ -213,20 +212,14 @@ namespace medical::imaging {
     private:
         // Internal methods
         void captureThread();
-
         void handleNewFrame(const std::shared_ptr<Frame> &frame);
-
         void performanceMonitorThread();
 
         // Utility methods
         Status setupDevice();
-
         Status setupSharedMemory();
-
         void updatePerformanceMetrics();
-
         bool setThreadPriority(std::thread &thread, bool isRealtime, int priority = 0);
-
         bool setThreadAffinity(std::thread &thread, int cpuCore);
 
         // Member variables
@@ -236,7 +229,7 @@ namespace medical::imaging {
 
         Config config_;
 
-        std::shared_ptr<UltrasoundDevice> device_;
+        std::shared_ptr<BlackmagicDevice> device_;
         std::shared_ptr<SharedMemory> sharedMemory_;
 
         std::function<void(std::shared_ptr<Frame>)> frameCallback_;
@@ -247,7 +240,7 @@ namespace medical::imaging {
         std::mutex mutex_;
 
         // Frame buffer for minimal buffering
-        std::vector<std::shared_ptr<Frame> > frameBuffer_;
+        std::vector<std::shared_ptr<Frame>> frameBuffer_;
         size_t frameBufferHead_;
         size_t frameBufferTail_;
         std::mutex frameBufferMutex_;
@@ -283,6 +276,6 @@ namespace medical::imaging {
         ~ImagingServiceManager();
 
         std::mutex mutex_;
-        std::unordered_map<std::string, std::shared_ptr<ImagingService> > services_;
+        std::unordered_map<std::string, std::shared_ptr<ImagingService>> services_;
     };
 } // namespace medical::imaging

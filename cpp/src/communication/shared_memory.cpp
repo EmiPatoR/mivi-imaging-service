@@ -26,6 +26,14 @@ namespace medical::imaging {
         bool isServer;
         void *mapping;
 
+        // Memory layout information
+        ControlBlock *controlBlock;  // Pointer to control block in shared memory
+        size_t controlBlockSize;     // Size of the control block
+        size_t metadataAreaSize;     // Size of the metadata area
+        size_t dataOffset;           // Offset to the start of the data region
+        size_t maxFrames;            // Maximum number of frames in the ring buffer
+        size_t frameSlotSize;        // Size allocated for each frame slot
+
         // POSIX shared memory specific
         int fd;
 
@@ -35,32 +43,17 @@ namespace medical::imaging {
         // Memory-mapped file specific
         std::string filePath;
 
-        // Control block structure - stored at the beginning of shared memory
-        struct ControlBlock {
-            std::atomic<uint64_t> writeIndex; // Current write position
-            std::atomic<uint64_t> readIndex; // Current read position
-            std::atomic<uint64_t> frameCount; // Number of frames in the buffer
-            std::atomic<uint64_t> totalFramesWritten; // Total number of frames written
-            std::atomic<uint64_t> totalFramesRead; // Total number of frames read
-            std::atomic<uint64_t> droppedFrames; // Frames dropped due to buffer full
-            std::atomic<bool> active; // Whether the shared memory is active
-            std::atomic<uint64_t> lastWriteTime; // Timestamp of last write (ns since epoch)
-            std::atomic<uint64_t> lastReadTime; // Timestamp of last read (ns since epoch)
-            std::atomic<uint64_t> maxFrameSize; // Maximum frame size seen
-            uint32_t metadataOffset; // Offset to JSON metadata
-            uint32_t metadataSize; // Size of metadata area
-            std::atomic<uint32_t> flags; // Additional flags
-            uint8_t padding[200]; // Padding to ensure proper alignment
-        };
-
-        ControlBlock *controlBlock; // Pointer to control block in shared memory
-        size_t controlBlockSize; // Size of the control block
-        size_t dataOffset; // Offset to the start of the data region
-        size_t maxFrames; // Maximum number of frames in the ring buffer
-
         // Constructor
-        Impl() : type(SharedMemoryType::POSIX_SHM), fd(-1), shmid(-1), mapping(nullptr),
-                 controlBlock(nullptr), controlBlockSize(0), dataOffset(0), maxFrames(0) {
+        Impl() : type(SharedMemoryType::POSIX_SHM),
+                 fd(-1),
+                 shmid(-1),
+                 mapping(nullptr),
+                 controlBlock(nullptr),
+                 controlBlockSize(0),
+                 metadataAreaSize(0),
+                 dataOffset(0),
+                 maxFrames(0),
+                 frameSlotSize(0) {
         }
 
         // Destructor
@@ -116,11 +109,14 @@ namespace medical::imaging {
             isServer = create;
             type = SharedMemoryType::POSIX_SHM;
 
-            // Calculate control block size and data offset
+            // Calculate control block size and metadata area size
             controlBlockSize = sizeof(ControlBlock);
-            dataOffset = controlBlockSize;
+            metadataAreaSize = 4096; // 4KB for metadata area
 
-            // Size must be large enough for the control block and at least one frame
+            // Calculate data offset
+            dataOffset = controlBlockSize + metadataAreaSize;
+
+            // Size must be large enough for the control block, metadata, and at least one frame
             if (size <= dataOffset + sizeof(FrameHeader)) {
                 return SharedMemory::Status::INVALID_SIZE;
             }
@@ -180,40 +176,56 @@ namespace medical::imaging {
             if (create) {
                 // Initialize the control block as server
                 new(controlBlock) ControlBlock();
-                controlBlock->writeIndex = 0;
-                controlBlock->readIndex = 0;
-                controlBlock->frameCount = 0;
-                controlBlock->totalFramesWritten = 0;
-                controlBlock->totalFramesRead = 0;
-                controlBlock->droppedFrames = 0;
-                controlBlock->active = true;
-                controlBlock->lastWriteTime = 0;
-                controlBlock->lastReadTime = 0;
-                controlBlock->maxFrameSize = 0;
-                controlBlock->metadataOffset = static_cast<uint32_t>(dataOffset);
-                controlBlock->metadataSize = 4096; // 4KB for metadata area
-                controlBlock->flags = 0;
+                controlBlock->writeIndex.store(0, std::memory_order_relaxed);
+                controlBlock->readIndex.store(0, std::memory_order_relaxed);
+                controlBlock->frameCount.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesWritten.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesRead.store(0, std::memory_order_relaxed);
+                controlBlock->droppedFrames.store(0, std::memory_order_relaxed);
+                controlBlock->active.store(true, std::memory_order_relaxed);
+                controlBlock->lastWriteTime.store(0, std::memory_order_relaxed);
+                controlBlock->lastReadTime.store(0, std::memory_order_relaxed);
+                controlBlock->metadataOffset = static_cast<uint32_t>(controlBlockSize);
+                controlBlock->metadataSize = static_cast<uint32_t>(metadataAreaSize);
+                controlBlock->flags.store(0, std::memory_order_relaxed);
 
-                // Update data offset to account for metadata area
-                dataOffset += controlBlock->metadataSize;
+                // Estimate the frame slot size - assume 1080p YUV (1920x1080x2 bytes + header)
+                size_t estimatedFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                frameSlotSize = estimatedFrameSize;
 
                 // Calculate the maximum number of frames that can fit
-                // Assuming average frame size of 1080p YUV (1920x1080x2 bytes + header)
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                maxFrames = (size - dataOffset) / frameSlotSize;
                 if (maxFrames < 1) {
                     maxFrames = 1;
                 }
+
+                // Initialize metadata area with JSON
+                json metadata = {
+                    {"format_version", "1.0"},
+                    {"created_at", std::chrono::system_clock::now().time_since_epoch().count()},
+                    {"type", "medical_imaging_frames"},
+                    {"frame_format", ""},
+                    {"max_frames", maxFrames},
+                    {"buffer_size", size},
+                    {"data_offset", dataOffset},
+                    {"frame_slot_size", frameSlotSize}
+                };
+
+                // Write metadata to shared memory
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                std::string metadataStr = metadata.dump();
+                std::strncpy(metadataPtr, metadataStr.c_str(), metadataAreaSize - 1);
+                metadataPtr[metadataAreaSize - 1] = '\0';
             } else {
                 // Client just uses the existing control block
                 // Wait for it to be initialized
                 int attempts = 0;
-                while (!controlBlock->active && attempts < 100) {
+                while (!controlBlock->active.load(std::memory_order_acquire) && attempts < 100) {
                     usleep(10000); // 10ms
                     attempts++;
                 }
 
-                if (!controlBlock->active) {
+                if (!controlBlock->active.load(std::memory_order_acquire)) {
                     std::cerr << "Timeout waiting for shared memory to be initialized" << std::endl;
                     munmap(mapping, size);
                     mapping = nullptr;
@@ -222,12 +234,30 @@ namespace medical::imaging {
                     return SharedMemory::Status::INTERNAL_ERROR;
                 }
 
-                // Get the data offset including metadata
-                dataOffset = controlBlockSize + controlBlock->metadataSize;
+                // Get the metadata size
+                metadataAreaSize = controlBlock->metadataSize;
 
-                // Get the maximum number of frames
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                // Get the data offset
+                dataOffset = controlBlockSize + metadataAreaSize;
+
+                // Read metadata to get frame slot size and max frames
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                try {
+                    json metadata = json::parse(metadataPtr);
+                    frameSlotSize = metadata.value("frame_slot_size", 0);
+                    maxFrames = metadata.value("max_frames", 0);
+                } catch (const std::exception &e) {
+                    std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                    // Fallback to estimation
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
+
+                if (maxFrames < 1 || frameSlotSize == 0) {
+                    std::cerr << "Invalid metadata, using fallback values" << std::endl;
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
             }
 
             return SharedMemory::Status::OK;
@@ -240,9 +270,12 @@ namespace medical::imaging {
             isServer = create;
             type = SharedMemoryType::SYSV_SHM;
 
-            // Calculate control block size and data offset
+            // Calculate control block size and metadata area size
             controlBlockSize = sizeof(ControlBlock);
-            dataOffset = controlBlockSize;
+            metadataAreaSize = 4096; // 4KB for metadata area
+
+            // Calculate data offset
+            dataOffset = controlBlockSize + metadataAreaSize;
 
             // Size must be large enough for the control block and at least one frame
             if (size <= dataOffset + sizeof(FrameHeader)) {
@@ -317,39 +350,56 @@ namespace medical::imaging {
             if (create) {
                 // Initialize the control block as server
                 new(controlBlock) ControlBlock();
-                controlBlock->writeIndex = 0;
-                controlBlock->readIndex = 0;
-                controlBlock->frameCount = 0;
-                controlBlock->totalFramesWritten = 0;
-                controlBlock->totalFramesRead = 0;
-                controlBlock->droppedFrames = 0;
-                controlBlock->active = true;
-                controlBlock->lastWriteTime = 0;
-                controlBlock->lastReadTime = 0;
-                controlBlock->maxFrameSize = 0;
-                controlBlock->metadataOffset = static_cast<uint32_t>(dataOffset);
-                controlBlock->metadataSize = 4096; // 4KB for metadata area
-                controlBlock->flags = 0;
+                controlBlock->writeIndex.store(0, std::memory_order_relaxed);
+                controlBlock->readIndex.store(0, std::memory_order_relaxed);
+                controlBlock->frameCount.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesWritten.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesRead.store(0, std::memory_order_relaxed);
+                controlBlock->droppedFrames.store(0, std::memory_order_relaxed);
+                controlBlock->active.store(true, std::memory_order_relaxed);
+                controlBlock->lastWriteTime.store(0, std::memory_order_relaxed);
+                controlBlock->lastReadTime.store(0, std::memory_order_relaxed);
+                controlBlock->metadataOffset = static_cast<uint32_t>(controlBlockSize);
+                controlBlock->metadataSize = static_cast<uint32_t>(metadataAreaSize);
+                controlBlock->flags.store(0, std::memory_order_relaxed);
 
-                // Update data offset to account for metadata area
-                dataOffset += controlBlock->metadataSize;
+                // Estimate the frame slot size - assume 1080p YUV (1920x1080x2 bytes + header)
+                size_t estimatedFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                frameSlotSize = estimatedFrameSize;
 
                 // Calculate the maximum number of frames that can fit
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                maxFrames = (size - dataOffset) / frameSlotSize;
                 if (maxFrames < 1) {
                     maxFrames = 1;
                 }
+
+                // Initialize metadata area with JSON
+                json metadata = {
+                    {"format_version", "1.0"},
+                    {"created_at", std::chrono::system_clock::now().time_since_epoch().count()},
+                    {"type", "medical_imaging_frames"},
+                    {"frame_format", ""},
+                    {"max_frames", maxFrames},
+                    {"buffer_size", size},
+                    {"data_offset", dataOffset},
+                    {"frame_slot_size", frameSlotSize}
+                };
+
+                // Write metadata to shared memory
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                std::string metadataStr = metadata.dump();
+                std::strncpy(metadataPtr, metadataStr.c_str(), metadataAreaSize - 1);
+                metadataPtr[metadataAreaSize - 1] = '\0';
             } else {
                 // Client just uses the existing control block
                 // Wait for it to be initialized
                 int attempts = 0;
-                while (!controlBlock->active && attempts < 100) {
+                while (!controlBlock->active.load(std::memory_order_acquire) && attempts < 100) {
                     usleep(10000); // 10ms
                     attempts++;
                 }
 
-                if (!controlBlock->active) {
+                if (!controlBlock->active.load(std::memory_order_acquire)) {
                     std::cerr << "Timeout waiting for SysV shared memory to be initialized" << std::endl;
                     shmdt(mapping);
                     mapping = nullptr;
@@ -357,12 +407,30 @@ namespace medical::imaging {
                     return SharedMemory::Status::INTERNAL_ERROR;
                 }
 
-                // Get the data offset including metadata
-                dataOffset = controlBlockSize + controlBlock->metadataSize;
+                // Get the metadata size
+                metadataAreaSize = controlBlock->metadataSize;
 
-                // Get the maximum number of frames
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                // Get the data offset
+                dataOffset = controlBlockSize + metadataAreaSize;
+
+                // Read metadata to get frame slot size and max frames
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                try {
+                    json metadata = json::parse(metadataPtr);
+                    frameSlotSize = metadata.value("frame_slot_size", 0);
+                    maxFrames = metadata.value("max_frames", 0);
+                } catch (const std::exception &e) {
+                    std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                    // Fallback to estimation
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
+
+                if (maxFrames < 1 || frameSlotSize == 0) {
+                    std::cerr << "Invalid metadata, using fallback values" << std::endl;
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
             }
 
             return SharedMemory::Status::OK;
@@ -376,9 +444,12 @@ namespace medical::imaging {
             isServer = create;
             type = SharedMemoryType::MEMORY_MAPPED_FILE;
 
-            // Calculate control block size and data offset
+            // Calculate control block size and metadata area size
             controlBlockSize = sizeof(ControlBlock);
-            dataOffset = controlBlockSize;
+            metadataAreaSize = 4096; // 4KB for metadata area
+
+            // Calculate data offset
+            dataOffset = controlBlockSize + metadataAreaSize;
 
             // Size must be large enough for the control block and at least one frame
             if (size <= dataOffset + sizeof(FrameHeader)) {
@@ -434,31 +505,30 @@ namespace medical::imaging {
             if (create) {
                 // Initialize the control block as server
                 new(controlBlock) ControlBlock();
-                controlBlock->writeIndex = 0;
-                controlBlock->readIndex = 0;
-                controlBlock->frameCount = 0;
-                controlBlock->totalFramesWritten = 0;
-                controlBlock->totalFramesRead = 0;
-                controlBlock->droppedFrames = 0;
-                controlBlock->active = true;
-                controlBlock->lastWriteTime = 0;
-                controlBlock->lastReadTime = 0;
-                controlBlock->maxFrameSize = 0;
-                controlBlock->metadataOffset = static_cast<uint32_t>(dataOffset);
-                controlBlock->metadataSize = 4096; // 4KB for metadata area
-                controlBlock->flags = 0;
+                controlBlock->writeIndex.store(0, std::memory_order_relaxed);
+                controlBlock->readIndex.store(0, std::memory_order_relaxed);
+                controlBlock->frameCount.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesWritten.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesRead.store(0, std::memory_order_relaxed);
+                controlBlock->droppedFrames.store(0, std::memory_order_relaxed);
+                controlBlock->active.store(true, std::memory_order_relaxed);
+                controlBlock->lastWriteTime.store(0, std::memory_order_relaxed);
+                controlBlock->lastReadTime.store(0, std::memory_order_relaxed);
+                controlBlock->metadataOffset = static_cast<uint32_t>(controlBlockSize);
+                controlBlock->metadataSize = static_cast<uint32_t>(metadataAreaSize);
+                controlBlock->flags.store(0, std::memory_order_relaxed);
 
-                // Update data offset to account for metadata area
-                dataOffset += controlBlock->metadataSize;
+                // Estimate the frame slot size - assume 1080p YUV (1920x1080x2 bytes + header)
+                size_t estimatedFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                frameSlotSize = estimatedFrameSize;
 
                 // Calculate the maximum number of frames that can fit
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                maxFrames = (size - dataOffset) / frameSlotSize;
                 if (maxFrames < 1) {
                     maxFrames = 1;
                 }
 
-                // Initialize metadata area with empty JSON
+                // Initialize metadata area with JSON
                 json metadata = {
                     {"format_version", "1.0"},
                     {"created_at", std::chrono::system_clock::now().time_since_epoch().count()},
@@ -466,24 +536,25 @@ namespace medical::imaging {
                     {"frame_format", ""},
                     {"max_frames", maxFrames},
                     {"buffer_size", size},
-                    {"data_offset", dataOffset}
+                    {"data_offset", dataOffset},
+                    {"frame_slot_size", frameSlotSize}
                 };
 
-                // Write JSON to metadata area
+                // Write metadata to shared memory
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
                 std::string metadataStr = metadata.dump();
-                char *metadataArea = static_cast<char *>(mapping) + controlBlock->metadataOffset;
-                std::strncpy(metadataArea, metadataStr.c_str(), controlBlock->metadataSize - 1);
-                metadataArea[controlBlock->metadataSize - 1] = '\0';
+                std::strncpy(metadataPtr, metadataStr.c_str(), metadataAreaSize - 1);
+                metadataPtr[metadataAreaSize - 1] = '\0';
             } else {
                 // Client just uses the existing control block
                 // Wait for it to be initialized
                 int attempts = 0;
-                while (!controlBlock->active && attempts < 100) {
+                while (!controlBlock->active.load(std::memory_order_acquire) && attempts < 100) {
                     usleep(10000); // 10ms
                     attempts++;
                 }
 
-                if (!controlBlock->active) {
+                if (!controlBlock->active.load(std::memory_order_acquire)) {
                     std::cerr << "Timeout waiting for memory-mapped file to be initialized" << std::endl;
                     munmap(mapping, size);
                     mapping = nullptr;
@@ -492,12 +563,30 @@ namespace medical::imaging {
                     return SharedMemory::Status::INTERNAL_ERROR;
                 }
 
-                // Get the data offset including metadata
-                dataOffset = controlBlockSize + controlBlock->metadataSize;
+                // Get the metadata size
+                metadataAreaSize = controlBlock->metadataSize;
 
-                // Get the maximum number of frames
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                // Get the data offset
+                dataOffset = controlBlockSize + metadataAreaSize;
+
+                // Read metadata to get frame slot size and max frames
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                try {
+                    json metadata = json::parse(metadataPtr);
+                    frameSlotSize = metadata.value("frame_slot_size", 0);
+                    maxFrames = metadata.value("max_frames", 0);
+                } catch (const std::exception &e) {
+                    std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                    // Fallback to estimation
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
+
+                if (maxFrames < 1 || frameSlotSize == 0) {
+                    std::cerr << "Invalid metadata, using fallback values" << std::endl;
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
             }
 
             return SharedMemory::Status::OK;
@@ -542,9 +631,12 @@ namespace medical::imaging {
             isServer = create;
             type = SharedMemoryType::HUGE_PAGES;
 
-            // Calculate control block size and data offset
+            // Calculate control block size and metadata area size
             controlBlockSize = sizeof(ControlBlock);
-            dataOffset = controlBlockSize;
+            metadataAreaSize = 4096; // 4KB for metadata area
+
+            // Calculate data offset
+            dataOffset = controlBlockSize + metadataAreaSize;
 
             // Size must be large enough for the control block and at least one frame
             if (size <= dataOffset + sizeof(FrameHeader)) {
@@ -613,31 +705,30 @@ namespace medical::imaging {
             if (create) {
                 // Initialize the control block as server
                 new(controlBlock) ControlBlock();
-                controlBlock->writeIndex = 0;
-                controlBlock->readIndex = 0;
-                controlBlock->frameCount = 0;
-                controlBlock->totalFramesWritten = 0;
-                controlBlock->totalFramesRead = 0;
-                controlBlock->droppedFrames = 0;
-                controlBlock->active = true;
-                controlBlock->lastWriteTime = 0;
-                controlBlock->lastReadTime = 0;
-                controlBlock->maxFrameSize = 0;
-                controlBlock->metadataOffset = static_cast<uint32_t>(dataOffset);
-                controlBlock->metadataSize = 4096; // 4KB for metadata area
-                controlBlock->flags = 0;
+                controlBlock->writeIndex.store(0, std::memory_order_relaxed);
+                controlBlock->readIndex.store(0, std::memory_order_relaxed);
+                controlBlock->frameCount.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesWritten.store(0, std::memory_order_relaxed);
+                controlBlock->totalFramesRead.store(0, std::memory_order_relaxed);
+                controlBlock->droppedFrames.store(0, std::memory_order_relaxed);
+                controlBlock->active.store(true, std::memory_order_relaxed);
+                controlBlock->lastWriteTime.store(0, std::memory_order_relaxed);
+                controlBlock->lastReadTime.store(0, std::memory_order_relaxed);
+                controlBlock->metadataOffset = static_cast<uint32_t>(controlBlockSize);
+                controlBlock->metadataSize = static_cast<uint32_t>(metadataAreaSize);
+                controlBlock->flags.store(0, std::memory_order_relaxed);
 
-                // Update data offset to account for metadata area
-                dataOffset += controlBlock->metadataSize;
+                // Estimate the frame slot size - assume 1080p YUV (1920x1080x2 bytes + header)
+                size_t estimatedFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                frameSlotSize = estimatedFrameSize;
 
                 // Calculate the maximum number of frames that can fit
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                maxFrames = (size - dataOffset) / frameSlotSize;
                 if (maxFrames < 1) {
                     maxFrames = 1;
                 }
 
-                // Initialize metadata area with empty JSON
+                // Initialize metadata area with JSON
                 json metadata = {
                     {"format_version", "1.0"},
                     {"created_at", std::chrono::system_clock::now().time_since_epoch().count()},
@@ -646,25 +737,26 @@ namespace medical::imaging {
                     {"max_frames", maxFrames},
                     {"buffer_size", size},
                     {"data_offset", dataOffset},
+                    {"frame_slot_size", frameSlotSize},
                     {"using_huge_pages", true},
                     {"huge_page_size", hugePageSize}
                 };
 
-                // Write JSON to metadata area
+                // Write metadata to shared memory
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
                 std::string metadataStr = metadata.dump();
-                char *metadataArea = static_cast<char *>(mapping) + controlBlock->metadataOffset;
-                std::strncpy(metadataArea, metadataStr.c_str(), controlBlock->metadataSize - 1);
-                metadataArea[controlBlock->metadataSize - 1] = '\0';
+                std::strncpy(metadataPtr, metadataStr.c_str(), metadataAreaSize - 1);
+                metadataPtr[metadataAreaSize - 1] = '\0';
             } else {
                 // Client just uses the existing control block
                 // Wait for it to be initialized
                 int attempts = 0;
-                while (!controlBlock->active && attempts < 100) {
+                while (!controlBlock->active.load(std::memory_order_acquire) && attempts < 100) {
                     usleep(10000); // 10ms
                     attempts++;
                 }
 
-                if (!controlBlock->active) {
+                if (!controlBlock->active.load(std::memory_order_acquire)) {
                     std::cerr << "Timeout waiting for shared memory to be initialized" << std::endl;
                     munmap(mapping, size);
                     mapping = nullptr;
@@ -673,25 +765,43 @@ namespace medical::imaging {
                     return SharedMemory::Status::INTERNAL_ERROR;
                 }
 
-                // Get the data offset including metadata
-                dataOffset = controlBlockSize + controlBlock->metadataSize;
+                // Get the metadata size
+                metadataAreaSize = controlBlock->metadataSize;
 
-                // Get the maximum number of frames
-                size_t avgFrameSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
-                maxFrames = (size - dataOffset) / avgFrameSize;
+                // Get the data offset
+                dataOffset = controlBlockSize + metadataAreaSize;
+
+                // Read metadata to get frame slot size and max frames
+                char *metadataPtr = static_cast<char *>(mapping) + controlBlock->metadataOffset;
+                try {
+                    json metadata = json::parse(metadataPtr);
+                    frameSlotSize = metadata.value("frame_slot_size", 0);
+                    maxFrames = metadata.value("max_frames", 0);
+                } catch (const std::exception &e) {
+                    std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                    // Fallback to estimation
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
+
+                if (maxFrames < 1 || frameSlotSize == 0) {
+                    std::cerr << "Invalid metadata, using fallback values" << std::endl;
+                    frameSlotSize = 1920 * 1080 * 2 + sizeof(FrameHeader);
+                    maxFrames = (size - dataOffset) / frameSlotSize;
+                }
             }
 
             return SharedMemory::Status::OK;
         }
 
-        // Get the offset of a frame in the ring buffer
-        size_t getFrameOffset(uint64_t index) const {
-            return dataOffset + (index % maxFrames) * sizeof(FrameHeader);
+        // Calculate frame offset in the shared memory
+        size_t calculateFrameOffset(uint64_t index) const {
+            return dataOffset + (index % maxFrames) * frameSlotSize;
         }
 
         // Get a pointer to a frame header
         FrameHeader *getFrameHeader(uint64_t index) const {
-            size_t offset = getFrameOffset(index);
+            size_t offset = calculateFrameOffset(index);
             if (offset + sizeof(FrameHeader) > size) {
                 return nullptr;
             }
@@ -700,8 +810,8 @@ namespace medical::imaging {
         }
 
         // Get a pointer to frame data
-        void *getFrameData(uint64_t index, size_t headerSize) const {
-            size_t offset = getFrameOffset(index) + headerSize;
+        void *getFrameData(uint64_t index) const {
+            size_t offset = calculateFrameOffset(index) + sizeof(FrameHeader);
             if (offset >= size) {
                 return nullptr;
             }
@@ -710,7 +820,7 @@ namespace medical::imaging {
         }
 
         // Update metadata in the shared memory
-        bool updateMetadata(const json &metadata) {
+        bool updateMetadataJson(const json &metadata) {
             if (!controlBlock || controlBlock->metadataOffset == 0 || controlBlock->metadataSize == 0) {
                 return false;
             }
@@ -735,7 +845,7 @@ namespace medical::imaging {
         }
 
         // Read metadata from the shared memory
-        json readMetadata() const {
+        json readMetadataJson() const {
             if (!controlBlock || controlBlock->metadataOffset == 0 || controlBlock->metadataSize == 0) {
                 return json{};
             }
@@ -850,13 +960,20 @@ namespace medical::imaging {
         // Start time for performance tracking
         auto startTime = std::chrono::high_resolution_clock::now();
 
+        // Get current indices and check if buffer is full
+        uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
+        uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+        uint64_t frameCount = writeIndex - readIndex;
+
+        bool bufferFull = frameCount >= impl_->maxFrames;
+
         // Check if the buffer is full and we need to wait
-        if (impl_->controlBlock->frameCount >= impl_->maxFrames && timeoutMs > 0) {
+        if (bufferFull && timeoutMs > 0) {
             // Calculate end time
             auto endTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
 
             // Wait for space to become available
-            while (impl_->controlBlock->frameCount >= impl_->maxFrames) {
+            while (bufferFull) {
                 // Sleep for a short time
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
@@ -866,34 +983,48 @@ namespace medical::imaging {
                     std::lock_guard<std::mutex> lock(statsMutex_);
                     stats_.bufferFullCount++;
                     stats_.droppedFrames++;
+                    impl_->controlBlock->droppedFrames.fetch_add(1, std::memory_order_relaxed);
+                    return Status::BUFFER_FULL;
+                }
+
+                // Re-check buffer status
+                readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+                frameCount = writeIndex - readIndex;
+                bufferFull = frameCount >= impl_->maxFrames;
+            }
+        } else if (bufferFull) {
+            // Buffer is full and we're not waiting - drop the frame if configured to do so
+            if (config_.dropFramesWhenFull) {
+                std::lock_guard<std::mutex> lock(statsMutex_);
+                stats_.bufferFullCount++;
+                stats_.droppedFrames++;
+                impl_->controlBlock->droppedFrames.fetch_add(1, std::memory_order_relaxed);
+                return Status::BUFFER_FULL;
+            } else {
+                // Otherwise, wait briefly and try once more
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+                frameCount = writeIndex - readIndex;
+                bufferFull = frameCount >= impl_->maxFrames;
+                if (bufferFull) {
+                    std::lock_guard<std::mutex> lock(statsMutex_);
+                    stats_.bufferFullCount++;
+                    stats_.droppedFrames++;
+                    impl_->controlBlock->droppedFrames.fetch_add(1, std::memory_order_relaxed);
                     return Status::BUFFER_FULL;
                 }
             }
-        } else if (impl_->controlBlock->frameCount >= impl_->maxFrames) {
-            // Buffer is full and we're not waiting
-            std::lock_guard<std::mutex> lock(statsMutex_);
-            stats_.bufferFullCount++;
-            stats_.droppedFrames++;
-            impl_->controlBlock->droppedFrames++;
-            return Status::BUFFER_FULL;
         }
 
-        // Get the current write index
-        uint64_t writeIndex = impl_->controlBlock->writeIndex;
-
-        // Get the frame header
+        // Get the frame header and data pointers
         FrameHeader *header = impl_->getFrameHeader(writeIndex);
         if (!header) {
             return Status::INTERNAL_ERROR;
         }
 
-        // Calculate the space required for this frame
-        const size_t requiredSize = sizeof(FrameHeader) + frame->getDataSize();
-
-        // Check if there's enough space for this frame
-        size_t frameOffset = impl_->getFrameOffset(writeIndex);
-        if (frameOffset + requiredSize > impl_->size) {
-            return Status::BUFFER_FULL;
+        void *dataPtr = impl_->getFrameData(writeIndex);
+        if (!dataPtr) {
+            return Status::INTERNAL_ERROR;
         }
 
         // Fill the header
@@ -906,37 +1037,17 @@ namespace medical::imaging {
         header->height = frame->getHeight();
         header->bytesPerPixel = frame->getBytesPerPixel();
         header->dataSize = frame->getDataSize();
-        header->sequenceNumber = writeIndex;
-
-        // Set format code
-        const std::string &format = frame->getFormat();
-        uint32_t formatCode = 0;
-        if (format == "YUV" || format == "YUV422") {
-            formatCode = 0x01;
-        } else if (format == "RGB" || format == "BGRA") {
-            formatCode = 0x02;
-        } else if (format == "YUV10" || format == "YUV422_10") {
-            formatCode = 0x03;
-        } else if (format == "RGB10") {
-            formatCode = 0x04;
-        } else {
-            formatCode = 0xFF; // Unknown
-        }
-        header->formatCode = formatCode;
+        header->formatCode = getFormatCode(frame->getFormat());
         header->flags = 0;
+        header->sequenceNumber = writeIndex;
+        header->metadataOffset = 0; // Not using per-frame metadata for now
+        header->metadataSize = 0;
 
         // If this frame came from shared memory originally, try to zero-copy
         if (frame->isMappedToSharedMemory()) {
-            // This is already in shared memory, just update metadata
-            // and avoid the copy
+            // This is already in shared memory, just set flag
             header->flags |= 0x01; // Flag indicating zero-copy
         } else {
-            // Copy the frame data
-            void *dataPtr = impl_->getFrameData(writeIndex, sizeof(FrameHeader));
-            if (!dataPtr) {
-                return Status::INTERNAL_ERROR;
-            }
-
             // Copy the frame data
             std::memcpy(dataPtr, frame->getData(), frame->getDataSize());
         }
@@ -944,7 +1055,7 @@ namespace medical::imaging {
         // Update metadata if enabled
         if (config_.enableMetadata) {
             // Read existing metadata
-            auto metadata = impl_->readMetadata();
+            auto metadata = impl_->readMetadataJson();
 
             // Update frame-specific metadata
             metadata["last_frame"]["width"] = frame->getWidth();
@@ -987,29 +1098,20 @@ namespace medical::imaging {
             metadata["last_frame"]["metadata"] = frameMetadataJson;
 
             // Update the metadata
-            impl_->updateMetadata(metadata);
+            impl_->updateMetadataJson(metadata);
         }
-
-        // Update the write index and frame count
-        uint64_t newWriteIndex = writeIndex + 1;
-        impl_->controlBlock->writeIndex = newWriteIndex;
-        impl_->controlBlock->totalFramesWritten++;
 
         // Update timestamp
-        impl_->controlBlock->lastWriteTime = std::chrono::steady_clock::now().time_since_epoch().count();
+        impl_->controlBlock->lastWriteTime.store(
+            std::chrono::system_clock::now().time_since_epoch().count(),
+            std::memory_order_release);
 
-        // Update max frame size
-        if (frame->getDataSize() > impl_->controlBlock->maxFrameSize) {
-            impl_->controlBlock->maxFrameSize = frame->getDataSize();
-        }
+        // Increment write index (release memory ordering ensures visibility to readers)
+        impl_->controlBlock->writeIndex.store(writeIndex + 1, std::memory_order_release);
 
-        // Increase the frame count if we haven't wrapped around yet
-        uint64_t readIndex = impl_->controlBlock->readIndex;
-        if (newWriteIndex > readIndex) {
-            impl_->controlBlock->frameCount = newWriteIndex - readIndex;
-        } else {
-            impl_->controlBlock->frameCount = impl_->maxFrames;
-        }
+        // Update frame count and total frames
+        impl_->controlBlock->frameCount.store(frameCount + 1, std::memory_order_release);
+        impl_->controlBlock->totalFramesWritten.fetch_add(1, std::memory_order_relaxed);
 
         // Calculate write latency
         auto endTime = std::chrono::high_resolution_clock::now();
@@ -1024,9 +1126,9 @@ namespace medical::imaging {
             stats_.maxWriteLatencyNs = std::max(stats_.maxWriteLatencyNs, static_cast<uint64_t>(duration));
             stats_.averageFrameSize = (stats_.averageFrameSize * (stats_.totalFramesWritten - 1) +
                                        frame->getDataSize()) / stats_.totalFramesWritten;
-            stats_.peakMemoryUsage = std::max(stats_.peakMemoryUsage, impl_->controlBlock->frameCount *
-                                                                      (sizeof(FrameHeader) + static_cast<size_t>(stats_.
-                                                                           averageFrameSize)));
+            stats_.peakMemoryUsage = std::max(stats_.peakMemoryUsage,
+                                             impl_->controlBlock->frameCount.load(std::memory_order_relaxed) *
+                                             (sizeof(FrameHeader) + static_cast<size_t>(stats_.averageFrameSize)));
         }
 
         return Status::OK;
@@ -1041,8 +1143,8 @@ namespace medical::imaging {
         auto startTime = std::chrono::high_resolution_clock::now();
 
         // Get the current write and read indices
-        uint64_t writeIndex = impl_->controlBlock->writeIndex;
-        uint64_t readIndex = impl_->controlBlock->readIndex;
+        uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
+        uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
 
         if (writeIndex == 0 || writeIndex <= readIndex) {
             return Status::BUFFER_EMPTY;
@@ -1058,7 +1160,7 @@ namespace medical::imaging {
         }
 
         // Get the frame data
-        void *dataPtr = impl_->getFrameData(latestIndex, sizeof(FrameHeader));
+        void *dataPtr = impl_->getFrameData(latestIndex);
         if (!dataPtr) {
             return Status::INTERNAL_ERROR;
         }
@@ -1070,25 +1172,13 @@ namespace medical::imaging {
             // TODO: Implement proper zero-copy for frames already in shared memory
         }
 
-        // Create a new frame that refers to the shared memory data (zero-copy)
-        std::string format;
-        switch (header->formatCode) {
-            case 0x01: format = "YUV";
-                break;
-            case 0x02: format = "BGRA";
-                break;
-            case 0x03: format = "YUV10";
-                break;
-            case 0x04: format = "RGB10";
-                break;
-            default: format = "Unknown";
-                break;
-        }
+        // Create a frame that maps directly to the shared memory (zero-copy)
+        std::string format = getFormatString(header->formatCode);
 
         // Create a mapped frame
         frame = Frame::createMapped(
             config_.name,
-            static_cast<uint8_t *>(dataPtr) - static_cast<uint8_t *>(impl_->mapping),
+            reinterpret_cast<uint8_t*>(dataPtr) - reinterpret_cast<uint8_t*>(impl_->mapping),
             header->dataSize,
             header->width,
             header->height,
@@ -1107,7 +1197,7 @@ namespace medical::imaging {
 
         // Load metadata if available
         if (config_.enableMetadata) {
-            auto metadata = impl_->readMetadata();
+            auto metadata = impl_->readMetadataJson();
             if (metadata.contains("last_frame") && metadata["last_frame"].contains("metadata")) {
                 auto &frameMetadataJson = metadata["last_frame"]["metadata"];
 
@@ -1166,14 +1256,18 @@ namespace medical::imaging {
                 if (frameMetadataJson.contains("attributes") &&
                     frameMetadataJson["attributes"].is_object()) {
                     for (auto &[key, value]: frameMetadataJson["attributes"].items()) {
-                        frameMetadata.attributes[key] = value;
+                        if (value.is_string()) {
+                            frameMetadata.attributes[key] = value.get<std::string>();
+                        }
                     }
                 }
             }
         }
 
         // Update timestamp
-        impl_->controlBlock->lastReadTime = std::chrono::steady_clock::now().time_since_epoch().count();
+        impl_->controlBlock->lastReadTime.store(
+            std::chrono::system_clock::now().time_since_epoch().count(),
+            std::memory_order_release);
 
         // Calculate read latency
         auto endTime = std::chrono::high_resolution_clock::now();
@@ -1201,8 +1295,8 @@ namespace medical::imaging {
         auto startTime = std::chrono::high_resolution_clock::now();
 
         // Get the current read index
-        uint64_t readIndex = impl_->controlBlock->readIndex;
-        uint64_t writeIndex = impl_->controlBlock->writeIndex;
+        uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+        uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
 
         // Check if there are any frames available
         if (readIndex >= writeIndex) {
@@ -1218,7 +1312,7 @@ namespace medical::imaging {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
                 // Check again
-                writeIndex = impl_->controlBlock->writeIndex;
+                writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
             }
 
             if (readIndex >= writeIndex) {
@@ -1233,37 +1327,18 @@ namespace medical::imaging {
         }
 
         // Get the frame data
-        void *dataPtr = impl_->getFrameData(readIndex, sizeof(FrameHeader));
+        void *dataPtr = impl_->getFrameData(readIndex);
         if (!dataPtr) {
             return Status::INTERNAL_ERROR;
         }
 
-        // Check if this is a zero-copy frame that's already in shared memory
-        if (header->flags & 0x01) {
-            // This is a zero-copy frame - create a reference to the original
-            // memory location instead of this shared memory
-            // TODO: Implement proper zero-copy for frames already in shared memory
-        }
+        // Create a frame that maps directly to the shared memory (zero-copy)
+        std::string format = getFormatString(header->formatCode);
 
-        // Create a new frame that refers to the shared memory data (zero-copy)
-        std::string format;
-        switch (header->formatCode) {
-            case 0x01: format = "YUV";
-                break;
-            case 0x02: format = "BGRA";
-                break;
-            case 0x03: format = "YUV10";
-                break;
-            case 0x04: format = "RGB10";
-                break;
-            default: format = "Unknown";
-                break;
-        }
-
-        // Create a frame that references the shared memory
+        // Create a mapped frame
         frame = Frame::createMapped(
             config_.name,
-            static_cast<uint8_t *>(dataPtr) - static_cast<uint8_t *>(impl_->mapping),
+            reinterpret_cast<uint8_t*>(dataPtr) - reinterpret_cast<uint8_t*>(impl_->mapping),
             header->dataSize,
             header->width,
             header->height,
@@ -1282,7 +1357,7 @@ namespace medical::imaging {
 
         // Load metadata if available
         if (config_.enableMetadata) {
-            auto metadata = impl_->readMetadata();
+            auto metadata = impl_->readMetadataJson();
             if (metadata.contains("last_frame") && metadata["last_frame"].contains("metadata")) {
                 auto &frameMetadataJson = metadata["last_frame"]["metadata"];
 
@@ -1317,18 +1392,21 @@ namespace medical::imaging {
         }
 
         // Update the read index
-        impl_->controlBlock->readIndex = readIndex + 1;
+        impl_->controlBlock->readIndex.store(readIndex + 1, std::memory_order_release);
 
         // Update timestamp
-        impl_->controlBlock->lastReadTime = std::chrono::steady_clock::now().time_since_epoch().count();
+        impl_->controlBlock->lastReadTime.store(
+            std::chrono::system_clock::now().time_since_epoch().count(),
+            std::memory_order_release);
 
         // Update the frame count
-        if (impl_->controlBlock->frameCount > 0) {
-            --impl_->controlBlock->frameCount;
+        uint64_t frameCount = impl_->controlBlock->frameCount.load(std::memory_order_relaxed);
+        if (frameCount > 0) {
+            impl_->controlBlock->frameCount.store(frameCount - 1, std::memory_order_release);
         }
 
         // Update statistics
-        impl_->controlBlock->totalFramesRead++;
+        impl_->controlBlock->totalFramesRead.fetch_add(1, std::memory_order_relaxed);
 
         // Calculate read latency
         auto endTime = std::chrono::high_resolution_clock::now();
@@ -1477,9 +1555,9 @@ namespace medical::imaging {
             std::lock_guard<std::mutex> lock(statsMutex_);
 
             // Update from control block
-            stats_.totalFramesWritten = impl_->controlBlock->totalFramesWritten;
-            stats_.totalFramesRead = impl_->controlBlock->totalFramesRead;
-            stats_.droppedFrames = impl_->controlBlock->droppedFrames;
+            stats_.totalFramesWritten = impl_->controlBlock->totalFramesWritten.load(std::memory_order_relaxed);
+            stats_.totalFramesRead = impl_->controlBlock->totalFramesRead.load(std::memory_order_relaxed);
+            stats_.droppedFrames = impl_->controlBlock->droppedFrames.load(std::memory_order_relaxed);
 
             return stats_;
         }
@@ -1496,7 +1574,7 @@ namespace medical::imaging {
 
         // Reset control block stats if initialized
         if (isInitialized_ && impl_->controlBlock && config_.create) {
-            impl_->controlBlock->droppedFrames = 0;
+            impl_->controlBlock->droppedFrames.store(0, std::memory_order_relaxed);
         }
     }
 
@@ -1521,7 +1599,7 @@ namespace medical::imaging {
             return 0;
         }
 
-        return impl_->controlBlock->frameCount;
+        return impl_->controlBlock->frameCount.load(std::memory_order_relaxed);
     }
 
     bool SharedMemory::isBufferFull() const {
@@ -1529,7 +1607,9 @@ namespace medical::imaging {
             return false;
         }
 
-        return impl_->controlBlock->frameCount >= impl_->maxFrames;
+        uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
+        uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+        return (writeIndex - readIndex) >= impl_->maxFrames;
     }
 
     bool SharedMemory::isBufferEmpty() const {
@@ -1537,7 +1617,44 @@ namespace medical::imaging {
             return true;
         }
 
-        return impl_->controlBlock->frameCount == 0;
+        uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
+        uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
+        return readIndex >= writeIndex;
+    }
+
+    SharedMemory::Status SharedMemory::updateMetadata(const std::string& key, const std::string& value) {
+        if (!isInitialized_ || !impl_->controlBlock) {
+            return Status::NOT_INITIALIZED;
+        }
+
+        // Read current metadata
+        auto metadata = impl_->readMetadataJson();
+
+        // Update the key-value pair
+        metadata[key] = value;
+
+        // Write back to shared memory
+        if (!impl_->updateMetadataJson(metadata)) {
+            return Status::WRITE_FAILED;
+        }
+
+        return Status::OK;
+    }
+
+    std::string SharedMemory::getMetadata(const std::string& key) const {
+        if (!isInitialized_ || !impl_->controlBlock) {
+            return "";
+        }
+
+        // Read metadata
+        auto metadata = impl_->readMetadataJson();
+
+        // Find the key
+        if (metadata.contains(key)) {
+            return metadata[key].dump();
+        }
+
+        return "";
     }
 
     void SharedMemory::notificationThread() {
@@ -1548,12 +1665,12 @@ namespace medical::imaging {
         }
 
         // Initial read index
-        uint64_t lastReadIndex = impl_->controlBlock->readIndex;
+        uint64_t lastReadIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
 
         while (!stopCallbackThread_) {
             // Get the current indices
-            uint64_t writeIndex = impl_->controlBlock->writeIndex;
-            uint64_t readIndex = impl_->controlBlock->readIndex;
+            uint64_t writeIndex = impl_->controlBlock->writeIndex.load(std::memory_order_acquire);
+            uint64_t readIndex = impl_->controlBlock->readIndex.load(std::memory_order_acquire);
 
             // Check if there are new frames
             if (writeIndex > lastReadIndex) {
@@ -1580,6 +1697,63 @@ namespace medical::imaging {
         }
     }
 
+    uint32_t SharedMemory::getFormatCode(const std::string& format) {
+        if (format == "YUV" || format == "YUV422") {
+            return 0x01;
+        } else if (format == "BGRA" || format == "RGB" || format == "RGBA") {
+            return 0x02;
+        } else if (format == "YUV10" || format == "YUV422_10") {
+            return 0x03;
+        } else if (format == "RGB10") {
+            return 0x04;
+        } else {
+            return 0xFF; // Unknown
+        }
+    }
+
+    std::string SharedMemory::getFormatString(uint32_t formatCode) {
+        switch (formatCode) {
+            case 0x01: return "YUV";
+            case 0x02: return "BGRA";
+            case 0x03: return "YUV10";
+            case 0x04: return "RGB10";
+            default: return "Unknown";
+        }
+    }
+
+    uint64_t SharedMemory::getCurrentTimeNanos() {
+        auto now = std::chrono::high_resolution_clock::now();
+        auto duration = now.time_since_epoch();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    }
+
+    size_t SharedMemory::calculateFrameOffset(uint64_t index) const {
+        return impl_->calculateFrameOffset(index);
+    }
+
+    bool SharedMemory::writeMetadataJson(const std::string& json) {
+        if (!isInitialized_) {
+            return false;
+        }
+
+        try {
+            auto metadata = nlohmann::json::parse(json);
+            return impl_->updateMetadataJson(metadata);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to parse JSON metadata: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    std::string SharedMemory::readMetadataJson() const {
+        if (!isInitialized_) {
+            return "{}";
+        }
+
+        auto metadata = impl_->readMetadataJson();
+        return metadata.dump();
+    }
+
     // SharedMemoryManager implementation
     SharedMemoryManager& SharedMemoryManager::getInstance() {
         static SharedMemoryManager instance;
@@ -1600,7 +1774,7 @@ namespace medical::imaging {
         // Create configuration
         SharedMemory::Config config;
         config.name = name;
-        config.size = size;
+        config.size = size > 0 ? size : 128 * 1024 * 1024; // Default to 128MB if size not specified
         config.type = type;
         config.create = true;  // Create as server
 

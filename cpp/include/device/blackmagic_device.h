@@ -27,10 +27,25 @@ namespace medical {
 namespace imaging {
 
 /**
+ * @enum DeviceFeature
+ * @brief Features that may be supported by the Blackmagic device
+ */
+enum class DeviceFeature {
+    DIRECT_MEMORY_ACCESS,     // Direct memory access (DMA)
+    GPU_DIRECT,               // Direct to GPU memory
+    HARDWARE_TIMESTAMP,       // Hardware-based timestamping
+    EXTERNAL_SYNC,            // External synchronization
+    FRAME_METADATA,           // Rich frame metadata
+    MULTIPLE_STREAMS,         // Multiple simultaneous streams
+    PROGRAMMABLE_ROI,         // Programmable region of interest
+    HARDWARE_COMPRESSION      // Hardware-based compression
+};
+
+/**
  * @class BlackmagicDevice
- * @brief Enhanced implementation of UltrasoundDevice for Blackmagic capture devices
+ * @brief Implementation for interfacing with Blackmagic capture devices
  *
- * This class provides concrete implementation for interfacing with
+ * This class provides implementation for interfacing with
  * Blackmagic capture devices, with performance optimizations and
  * zero-copy support where possible.
  */

@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/imaging_service_daemon.dir/src/main.cpp.o -o imaging_service_daemon  -Wl,-rpath,/home/emip/Desktop/mivi-imaging-service/cmake/build: libultrasound_imaging.so libblackmagic_sdk.a -lrt -lpthread -ldl 

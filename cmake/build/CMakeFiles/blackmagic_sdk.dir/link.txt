@@ -1,0 +1,2 @@
+/usr/bin/ar qc libblackmagic_sdk.a CMakeFiles/blackmagic_sdk.dir/ext/blackmagic_sdk/DeckLinkAPIDispatch.cpp.o
+/usr/bin/ranlib libblackmagic_sdk.a

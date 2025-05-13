@@ -226,6 +226,9 @@ public:
      */
     double getCurrentFrameRate() const;
 
+    bool initializeGpuBufferPool(size_t bufferCount, size_t bufferSize);
+
+
     /**
      * @brief Get device-specific diagnostics
      * @return Map of diagnostic name to value

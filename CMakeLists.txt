@@ -1,15 +1,17 @@
-cmake_minimum_required(VERSION 3.14)
-project(MedicalUltrasoundImaging VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.21)
+# Let CMake auto-detect CUDA architecture
+set(CMAKE_CUDA_ARCHITECTURES auto)
+set(CMAKE_CUDA_COMPILER /usr/local/cuda-12.8/bin/nvcc)
+project(MedicalUltrasoundImaging VERSION 1.0.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(Protobuf_PROTOC_EXECUTABLE /usr/local/bin/protoc)
 
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Find required packages
 find_package(Threads REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # Option to build shared library (for FFI)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
@@ -18,14 +20,13 @@ option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 set(INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(BLACKMAGIC_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/blackmagic_sdk)
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
-set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
 # Include directories
 include_directories(
         ${INCLUDE_DIR}
         ${BLACKMAGIC_SDK_DIR}
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
 # Blackmagic SDK library
@@ -39,14 +40,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 
-# Core imaging library
+# Core imaging library with CUDA support
 add_library(ultrasound_imaging SHARED
         ${SRC_DIR}/device/device_manager.cpp
         ${SRC_DIR}/device/blackmagic_device.cpp
         ${SRC_DIR}/frame/frame.cpp
         ${SRC_DIR}/communication/shared_memory.cpp
         ${SRC_DIR}/api/imaging_service.cpp
+        ${SRC_DIR}/utils/cuda_helper.cpp
 )
+
+set_target_properties(ultrasound_imaging PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_STANDARD 14
+)
+target_compile_options(ultrasound_imaging PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+
 
 # Include generated directories
 target_include_directories(ultrasound_imaging
@@ -63,6 +72,7 @@ target_link_libraries(ultrasound_imaging
         pthread # For threading
         Threads::Threads
         dl
+        CUDA::cudart
 )
 
 # Executables

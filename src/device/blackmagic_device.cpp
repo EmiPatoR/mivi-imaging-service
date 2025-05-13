@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <numeric>
 
+#include "utils/cuda_helper.h"
+
 namespace medical::imaging {
     /**
      * @brief Enhanced implementation of IDeckLinkInputCallback for frame callbacks
@@ -442,6 +444,104 @@ namespace medical::imaging {
     }
 
 
+    bool BlackmagicDevice::initializeGpuDirect() {
+        // Check if CUDA is available
+        auto &cudaHelper = CudaHelper::getInstance();
+        if (!cudaHelper.isCudaAvailable()) {
+            std::cerr << "CUDA is not available for GPU-Direct" << std::endl;
+            return false;
+        }
+
+        // Check if the device has DMA capability
+        if (!capabilities_.supportsDma) {
+            std::cerr << "Device does not support DMA for GPU-Direct" << std::endl;
+            return false;
+        }
+
+        std::cout << "Initializing GPU-Direct with CUDA..." << std::endl;
+
+        // Get device properties
+        cudaDeviceProp props = cudaHelper.getDeviceProperties();
+
+        // Log device information
+        std::cout << "Using CUDA device: " << props.name << " with "
+                << (props.totalGlobalMem / (1024 * 1024)) << "MB memory" << std::endl;
+
+        // Check if GPU supports DMA from external devices
+        if (props.canMapHostMemory != 1) {
+            std::cerr << "CUDA device does not support mapping host memory for DMA" << std::endl;
+            return false;
+        }
+
+        // Initialize buffer pool with GPU memory
+        size_t bufferSize = currentConfig_.width * currentConfig_.height *
+                            (currentConfig_.pixelFormat == "YUV" ? 2 : 4);
+
+        if (!initializeGpuBufferPool(currentConfig_.bufferCount, bufferSize)) {
+            std::cerr << "Failed to initialize GPU buffer pool" << std::endl;
+            return false;
+        }
+
+        std::cout << "GPU-Direct successfully initialized" << std::endl;
+        return true;
+    }
+
+    // Add new method to initialize GPU buffer pool
+    bool BlackmagicDevice::initializeGpuBufferPool(size_t bufferCount, size_t bufferSize) {
+        if (bufferCount == 0 || bufferSize == 0) {
+            std::cerr << "Invalid buffer count or size for GPU pool" << std::endl;
+            return false;
+        }
+
+        auto &cudaHelper = CudaHelper::getInstance();
+        std::lock_guard<std::mutex> lock(bufferPoolMutex_);
+
+        // Clear existing pool
+        for (auto &buffer: bufferPool_) {
+            if (buffer.memory) {
+                // Free CPU memory
+                free(buffer.memory);
+                buffer.memory = nullptr;
+            }
+        }
+
+        bufferPool_.clear();
+
+        // Allocate GPU buffers
+        bufferPool_.resize(bufferCount);
+
+        for (size_t i = 0; i < bufferCount; ++i) {
+            Buffer &buffer = bufferPool_[i];
+            void *gpuMemory = nullptr;
+
+            // Allocate GPU memory
+            cudaError_t status = cudaHelper.allocateMemory(&gpuMemory, bufferSize);
+            if (status != cudaSuccess) {
+                std::cerr << "Failed to allocate GPU memory for buffer " << i << std::endl;
+
+                // Clean up previously allocated buffers
+                for (size_t j = 0; j < i; ++j) {
+                    if (bufferPool_[j].memory) {
+                        cudaHelper.freeMemory(bufferPool_[j].memory);
+                        bufferPool_[j].memory = nullptr;
+                    }
+                }
+
+                bufferPool_.clear();
+                return false;
+            }
+
+            buffer.memory = gpuMemory;
+            buffer.size = bufferSize;
+            buffer.inUse = false;
+            buffer.isExternal = false;
+        }
+
+        std::cout << "GPU buffer pool initialized with " << bufferCount
+                << " buffers of size " << bufferSize << " bytes" << std::endl;
+        return true;
+    }
+
     BlackmagicDevice::Status BlackmagicDevice::startCapture(
         std::function<void(std::shared_ptr<Frame>)> frameCallback) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -859,8 +959,8 @@ namespace medical::imaging {
         return frame;
     }
 
-    std::shared_ptr<Frame> BlackmagicDevice::convertFrameExternalMemory(IDeckLinkVideoInputFrame *videoFrame,
-                                                                        IDeckLinkAudioInputPacket *audioPacket) {
+    std::shared_ptr<Frame> BlackmagicDevice::convertFrameExternalMemory(
+        IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioPacket) {
         if (!videoFrame) {
             return nullptr;
         }
@@ -875,18 +975,18 @@ namespace medical::imaging {
         // Get frame data
         void *frameBytes = nullptr;
         void *destinationBuffer = nullptr;
+        bool useGpuMemory = isGpuDirectEnabled_;
 
         // Allocate a buffer from the pool or use external memory
         Buffer *buffer = nullptr;
 
         if (!directSharedMemoryName_.empty()) {
-            // Use direct shared memory output
-            // This would require shared memory implementation specific code
-            // For now, fallback to normal path
+            // Use direct shared memory output (unchanged)
             return convertFrame(videoFrame, audioPacket);
         } else if (externalMemory_ && externalMemorySize_ >= dataSize) {
-            // Use provided external memory
+            // Use provided external memory (unchanged)
             destinationBuffer = externalMemory_;
+            useGpuMemory = false; // External memory is CPU memory
         } else {
             // Try to get a buffer from the pool
             buffer = allocateBuffer(dataSize);
@@ -899,42 +999,90 @@ namespace medical::imaging {
         }
 
         // Get the source frame data
-        IDeckLinkVideoBuffer *videoFrameBuffer = nullptr;
-        if (videoFrame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **) &videoFrameBuffer) != S_OK) {
-            // Failed to get video buffer interface
-            if (buffer) {
-                releaseBuffer(buffer);
+        if (useGpuMemory) {
+            // For GPU memory path:
+            IDeckLinkVideoBuffer *videoFrameBuffer = nullptr;
+            if (videoFrame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **) &videoFrameBuffer) != S_OK) {
+                // Failed to get video buffer interface
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
             }
-            return nullptr;
-        }
 
-        // Start access to buffer
-        if (videoFrameBuffer->StartAccess(bmdBufferAccessRead) != S_OK) {
-            videoFrameBuffer->Release();
-            if (buffer) {
-                releaseBuffer(buffer);
+            // Start access to buffer
+            if (videoFrameBuffer->StartAccess(bmdBufferAccessRead) != S_OK) {
+                videoFrameBuffer->Release();
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
             }
-            return nullptr;
-        }
 
-        // Get the buffer pointer
-        videoFrameBuffer->GetBytes(&frameBytes);
+            // Get the buffer pointer
+            videoFrameBuffer->GetBytes(&frameBytes);
 
-        if (!frameBytes) {
+            if (!frameBytes) {
+                videoFrameBuffer->EndAccess(bmdBufferAccessRead);
+                videoFrameBuffer->Release();
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
+            }
+
+            // For GPU path - use CUDA to copy directly to GPU
+            auto &cudaHelper = CudaHelper::getInstance();
+            cudaError_t status = cudaHelper.copyHostToDevice(
+                destinationBuffer, frameBytes, dataSize);
+
+            // End access and release
             videoFrameBuffer->EndAccess(bmdBufferAccessRead);
             videoFrameBuffer->Release();
-            if (buffer) {
-                releaseBuffer(buffer);
+
+            if (status != cudaSuccess) {
+                std::cerr << "CUDA copy failed: " << cudaHelper.getLastErrorString() << std::endl;
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
             }
-            return nullptr;
+        } else {
+            // CPU memory path (unchanged)
+            IDeckLinkVideoBuffer *videoFrameBuffer = nullptr;
+            if (videoFrame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **) &videoFrameBuffer) != S_OK) {
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
+            }
+
+            if (videoFrameBuffer->StartAccess(bmdBufferAccessRead) != S_OK) {
+                videoFrameBuffer->Release();
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
+            }
+
+            videoFrameBuffer->GetBytes(&frameBytes);
+
+            if (!frameBytes) {
+                videoFrameBuffer->EndAccess(bmdBufferAccessRead);
+                videoFrameBuffer->Release();
+                if (buffer) {
+                    releaseBuffer(buffer);
+                }
+                return nullptr;
+            }
+
+            // Copy the data to our buffer
+            std::memcpy(destinationBuffer, frameBytes, dataSize);
+
+            // End access to source buffer
+            videoFrameBuffer->EndAccess(bmdBufferAccessRead);
+            videoFrameBuffer->Release();
         }
-
-        // Copy the data to our buffer
-        std::memcpy(destinationBuffer, frameBytes, dataSize);
-
-        // End access to source buffer
-        videoFrameBuffer->EndAccess(bmdBufferAccessRead);
-        videoFrameBuffer->Release();
 
         // Create frame with our buffer
         auto frame = Frame::createWithExternalData(
@@ -944,7 +1092,8 @@ namespace medical::imaging {
             height,
             rowBytes / width,
             getPixelFormatString(pixelFormat),
-            false); // Don't take ownership
+            false, // Don't take ownership
+            useGpuMemory ? BufferType::GPU_MEMORY : BufferType::CPU_MEMORY);
 
         if (!frame) {
             if (buffer) {
@@ -987,6 +1136,12 @@ namespace medical::imaging {
         metadata.bytesPerPixel = rowBytes / width;
         metadata.frameNumber = frameCount_;
         metadata.hasBeenProcessed = false;
+
+        // Add GPU metadata
+        if (useGpuMemory) {
+            metadata.attributes["gpu_memory"] = "true";
+            metadata.attributes["gpu_direct_enabled"] = "true";
+        }
 
         // Add timecode if available
         IDeckLinkTimecode *timecode = nullptr;
@@ -1103,14 +1258,6 @@ namespace medical::imaging {
         return capabilities_.supportsDma;
     }
 
-    bool BlackmagicDevice::initializeGpuDirect() {
-        // This is a stub implementation - real GPU direct setup would involve
-        // using CUDA, OpenCL, or other GPU APIs to allocate GPU memory
-
-        // For simulation purposes, we'll just pretend we succeeded
-        return capabilities_.supportsGpuDirect;
-    }
-
 
     bool BlackmagicDevice::initializeBufferPool(size_t bufferCount, size_t bufferSize) {
         if (bufferCount == 0 || bufferSize == 0) {
@@ -1121,7 +1268,7 @@ namespace medical::imaging {
         std::lock_guard<std::mutex> lock(bufferPoolMutex_);
 
         // Clear existing pool
-        for (auto& buffer : bufferPool_) {
+        for (auto &buffer: bufferPool_) {
             if (buffer.memory) {
                 free(buffer.memory);
                 buffer.memory = nullptr;
@@ -1155,7 +1302,8 @@ namespace medical::imaging {
             buffer.isExternal = false;
         }
 
-        std::cout << "Buffer pool initialized with " << bufferCount << " buffers of size " << bufferSize << " bytes" << std::endl;
+        std::cout << "Buffer pool initialized with " << bufferCount << " buffers of size " << bufferSize << " bytes" <<
+                std::endl;
         return true;
     }
 

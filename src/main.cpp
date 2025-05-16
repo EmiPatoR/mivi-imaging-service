@@ -1,4 +1,5 @@
-#include "api/imaging_service.h"
+#include "api/universal_imaging_service.h"
+#include "device/imaging_device_adapter.h"
 #include <iostream>
 #include <string>
 #include <csignal>
@@ -34,6 +35,7 @@ void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n";
     std::cout << "Options:\n";
     std::cout << "  --device <id>              Device ID to use (default: auto-select)\n";
+    std::cout << "  --prefer-webcams           Prefer webcams over Blackmagic devices\n";
     std::cout << "  --width <pixels>           Frame width (default: 1920)\n";
     std::cout << "  --height <pixels>          Frame height (default: 1080)\n";
     std::cout << "  --frame-rate <fps>         Frame rate (default: 60.0)\n";
@@ -52,6 +54,7 @@ void printUsage(const char* programName) {
     std::cout << "  --log-interval <ms>        Log interval in ms (default: 5000)\n";
     std::cout << "  --diagnostics-file <path>  Path to write diagnostics (default: none)\n";
     std::cout << "  --nice-value <value>       Process nice value (-20 to 19, default: -10)\n";
+    std::cout << "  --list-devices             List all available devices and exit\n";
     std::cout << "  --help                     Show this help message\n";
 }
 
@@ -62,6 +65,12 @@ void printStatistics(const std::map<std::string, std::string>& stats) {
     std::cout << "┌─────────────────────────────────────────────────────────┐\n";
     std::cout << "│ Acquisition Service Statistics                          │\n";
     std::cout << "├─────────────────────────────────────────────────────────┤\n";
+
+    // Device type
+    if (stats.count("service_type")) {
+        std::cout << "│ Service type: " << std::setw(42) << std::left
+                  << stats.at("service_type") << "│\n";
+    }
 
     // Performance metrics
     if (stats.count("frame_count")) {
@@ -135,20 +144,51 @@ void printStatistics(const std::map<std::string, std::string>& stats) {
     std::cout << "└─────────────────────────────────────────────────────────┘\n";
 }
 
-void printDevices(const std::vector<std::string>& deviceIds,
-                  medical::imaging::DeviceManager& deviceManager) {
+void printDevices(const std::vector<medical::imaging::ImagingDeviceAdapter::DeviceInfo>& devices) {
     std::cout << "┌─────────────────────────────────────────────────────────┐\n";
     std::cout << "│ Available Devices                                       │\n";
     std::cout << "├─────────────────────────────────────────────────────────┤\n";
 
-    if (deviceIds.empty()) {
+    if (devices.empty()) {
         std::cout << "│ No devices found                                        │\n";
     } else {
-        for (const auto& id : deviceIds) {
-            auto device = deviceManager.getDevice(id);
-            if (device) {
-                std::string deviceInfo = " " + id + ": " + device->getDeviceName() +
-                                       " (" + device->getDeviceModel() + ")";
+        // First display Blackmagic devices
+        bool hasPrinted = false;
+
+        for (const auto& device : devices) {
+            if (device.type == medical::imaging::ImagingDeviceAdapter::DeviceType::BLACKMAGIC) {
+                if (!hasPrinted) {
+                    std::cout << "│ Blackmagic Devices:                                    │\n";
+                    hasPrinted = true;
+                }
+
+                std::string deviceInfo = " " + device.id + ": " + device.name +
+                                      " (" + device.model + ")";
+
+                // Truncate if too long
+                if (deviceInfo.length() > 55) {
+                    deviceInfo = deviceInfo.substr(0, 52) + "...";
+                }
+
+                // Pad to fill the width
+                deviceInfo.resize(55, ' ');
+
+                std::cout << "│" << deviceInfo << "│\n";
+            }
+        }
+
+        // Then display webcam devices
+        hasPrinted = false;
+
+        for (const auto& device : devices) {
+            if (device.type == medical::imaging::ImagingDeviceAdapter::DeviceType::WEBCAM) {
+                if (!hasPrinted) {
+                    std::cout << "│ Webcam Devices:                                        │\n";
+                    hasPrinted = true;
+                }
+
+                std::string deviceInfo = " " + device.id + ": " + device.name +
+                                      " (" + device.model + ")";
 
                 // Truncate if too long
                 if (deviceInfo.length() > 55) {
@@ -181,7 +221,7 @@ bool setProcessPriority(int niceValue) {
 
 // New function to write diagnostics to a file periodically
 void writeDiagnostics(const std::string& filePath,
-                     const medical::imaging::ImagingService& service) {
+                     const medical::imaging::UniversalImagingService& service) {
     if (filePath.empty()) {
         return;
     }
@@ -206,14 +246,17 @@ int main(int argc, char *argv[]) {
     // Default nice value
     int niceValue = -10;
 
+    // Flag to just list devices
+    bool listDevicesOnly = false;
+
     // Diagnostics file path
     std::string diagnosticsFile;
 
-    // Create the imaging service
-    medical::imaging::ImagingService service;
+    // Create the universal imaging service
+    medical::imaging::UniversalImagingService service;
 
     // Create configuration
-    medical::imaging::ImagingService::Config config;
+    medical::imaging::UniversalImagingService::Config config;
 
     // Process command line arguments
     for (int i = 1; i < argc; i++) {
@@ -221,6 +264,8 @@ int main(int argc, char *argv[]) {
 
         if (arg == "--device" && i + 1 < argc) {
             config.deviceId = argv[++i];
+        } else if (arg == "--prefer-webcams") {
+            config.preferWebcams = true;
         } else if (arg == "--width" && i + 1 < argc) {
             config.deviceConfig.width = std::stoi(argv[++i]);
         } else if (arg == "--height" && i + 1 < argc) {
@@ -268,6 +313,8 @@ int main(int argc, char *argv[]) {
             niceValue = std::stoi(argv[++i]);
             // Clamp to valid range
             niceValue = std::max(-20, std::min(19, niceValue));
+        } else if (arg == "--list-devices") {
+            listDevicesOnly = true;
         } else if (arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -278,32 +325,25 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    config.deviceConfig.bufferCount = 16; // Increase from 3 to 6
-    config.sharedMemorySize = 512 * 1024 * 1024; // 512 MB instead of 128 MB
-    //config.maxFrameSize = 17 * 1024 * 1024; // 17MB per frame
-
     // Set process priority
     if (!setProcessPriority(niceValue)) {
         std::cerr << "Failed to set nice value: " << niceValue << std::endl;
     }
 
     // List available devices
-    auto &deviceManager = medical::imaging::DeviceManager::getInstance();
-    auto deviceIds = deviceManager.getAvailableDeviceIds();
+    auto deviceInfoList = medical::imaging::UniversalImagingService::getAvailableDeviceInfo();
+    printDevices(deviceInfoList);
 
-    printDevices(deviceIds, deviceManager);
-
-    // If no device ID was specified, use the first one
-    if (config.deviceId.empty() && !deviceIds.empty()) {
-        config.deviceId = deviceIds[0];
-        std::cout << "Using device: " << config.deviceId << std::endl;
+    // If we just need to list devices, exit
+    if (listDevicesOnly) {
+        return 0;
     }
 
     // Initialize the service
-    std::cout << "Initializing imaging service..." << std::endl;
+    std::cout << "Initializing universal imaging service..." << std::endl;
     auto status = service.initialize(config);
 
-    if (status != medical::imaging::ImagingService::Status::OK) {
+    if (status != medical::imaging::UniversalImagingService::Status::OK) {
         std::cerr << "Failed to initialize imaging service (error code: " << static_cast<int>(status) << ")" << std::endl;
         return 1;
     }
@@ -312,12 +352,26 @@ int main(int argc, char *argv[]) {
     std::cout << "Starting imaging service..." << std::endl;
     status = service.start();
 
-    if (status != medical::imaging::ImagingService::Status::OK) {
+    if (status != medical::imaging::UniversalImagingService::Status::OK) {
         std::cerr << "Failed to start imaging service (error code: " << static_cast<int>(status) << ")" << std::endl;
         return 1;
     }
 
-    std::cout << "Service running. Press Ctrl+C to stop." << std::endl;
+    // Print info about active service type
+    std::string serviceType;
+    switch (service.getActiveServiceType()) {
+        case medical::imaging::ImagingDeviceAdapter::DeviceType::BLACKMAGIC:
+            serviceType = "Blackmagic";
+            break;
+        case medical::imaging::ImagingDeviceAdapter::DeviceType::WEBCAM:
+            serviceType = "Webcam";
+            break;
+        default:
+            serviceType = "Unknown";
+            break;
+    }
+
+    std::cout << "Service running with " << serviceType << " device. Press Ctrl+C to stop." << std::endl;
     std::cout << std::endl;
     std::cout << "Frames are being written to shared memory: " << config.sharedMemoryName << std::endl;
     std::cout << "Other services can now connect to this shared memory to process frames." << std::endl;
@@ -351,7 +405,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Stopping imaging service..." << std::endl;
     status = service.stop();
 
-    if (status != medical::imaging::ImagingService::Status::OK) {
+    if (status != medical::imaging::UniversalImagingService::Status::OK) {
         std::cerr << "Failed to stop imaging service (error code: " << static_cast<int>(status) << ")" << std::endl;
         return 1;
     }

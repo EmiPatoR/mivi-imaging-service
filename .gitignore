@@ -3,4 +3,5 @@ cpp/cmake-build-release/
 cpp/build/
 cpp/cmake/build/
 cpp/cmake/
+cmake/
 .idea/

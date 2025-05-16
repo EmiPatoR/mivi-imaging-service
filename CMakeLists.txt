@@ -10,8 +10,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 
 # Find required packages
+find_package(OpenCV REQUIRED)
 find_package(Threads REQUIRED)
 find_package(CUDAToolkit REQUIRED)
+
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+# Include directories
+include_directories(include)
 
 # Option to build shared library (for FFI)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
@@ -43,10 +49,16 @@ endif()
 # Core imaging library with CUDA support
 add_library(ultrasound_imaging SHARED
         ${SRC_DIR}/device/device_manager.cpp
+        ${SRC_DIR}/device/imaging_device_manager.cpp
         ${SRC_DIR}/device/blackmagic_device.cpp
+        ${SRC_DIR}/device/webcam_device.cpp
+        ${SRC_DIR}/device/imaging_device_adapter.cpp
+        ${SRC_DIR}/device/device_adapters.cpp
         ${SRC_DIR}/frame/frame.cpp
         ${SRC_DIR}/communication/shared_memory.cpp
         ${SRC_DIR}/api/imaging_service.cpp
+        ${SRC_DIR}/api/webcam_imaging_service.cpp
+        ${SRC_DIR}/api/universal_imaging_service.cpp
         ${SRC_DIR}/utils/cuda_helper.cpp
 )
 
@@ -67,6 +79,7 @@ target_include_directories(ultrasound_imaging
 # Link protobuf and gRPC libraries and generated files
 target_link_libraries(ultrasound_imaging
         PUBLIC
+        ${OpenCV_LIBS}
         blackmagic_sdk
         rt  # For POSIX shared memory
         pthread # For threading
